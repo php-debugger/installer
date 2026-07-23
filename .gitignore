@@ -1,0 +1,7 @@
+# Built binary
+/php-debugger
+/php-debugger.exe
+
+# Go build/test artifacts
+*.test
+*.out
