@@ -44,6 +44,7 @@ func newRootCmd() *cobra.Command {
 		newUpdateCmd(),
 		newUninstallCmd(),
 		newSwitchCmd(),
+		newResolveCmd(),
 	)
 
 	return rootCmd
