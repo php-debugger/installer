@@ -12,24 +12,28 @@ import (
 )
 
 // configPair is a source ini file and where its (sanitized) copy is written.
+// For in-place edits src == dst.
 type configPair struct{ src, dst string }
 
-// copyConfig copies the existing interpreter's ini files into the new
-// interpreter's compiled-in config path (so the new php loads the same
-// configuration), sanitizing each on the way: xdebug loader lines are stripped,
-// and disallowed xdebug.mode tokens are removed after confirmation.
-//
-// It registers undo steps on rb (restoring overwritten files / removing created
-// ones) and returns the list of destination files written.
-func copyConfig(existing, target *php.Info, rb *rollback, opts Options) ([]string, error) {
-	pairs := configPairs(existing, target)
-	if len(pairs) == 0 {
-		if target.Ini.ConfigPath == "" && target.Ini.ScanDir == "" {
-			opts.logf("Note: the interpreter reports no config path; skipping ini copy.")
-		}
-		return nil, nil
-	}
+// iniRewriteOptions captures the two ways the interpreter and extension flows
+// differ when applying the ini rules.
+type iniRewriteOptions struct {
+	// commentOtherLoaders comments out non-xdebug extension= / zend_extension=
+	// loaders. Used for the interpreter (a self-contained build cannot load
+	// foreign .so files); not for the extension (the existing php loads its own).
+	commentOtherLoaders bool
+	// skipUnchanged avoids writing (and registering undo for) files the rules
+	// leave untouched. Used for in-place edits of an existing php's config.
+	skipUnchanged bool
+}
 
+// rewriteIniFiles applies the shared ini rules to a set of (src -> dst) pairs:
+// strip xdebug loaders, optionally comment other extension loaders, and — after
+// a single confirmation covering all files — sanitize disallowed xdebug.mode
+// tokens. It registers undo steps on rb and returns the destination files
+// written. This is the one place the xdebug/ini handling lives; the interpreter
+// and extension flows differ only via iniRewriteOptions.
+func rewriteIniFiles(pairs []configPair, cfg iniRewriteOptions, rb *rollback, opts Options) ([]string, error) {
 	stripModes, err := decideStripModes(pairs, opts)
 	if err != nil {
 		return nil, err
@@ -42,12 +46,18 @@ func copyConfig(existing, target *php.Info, rb *rollback, opts Options) ([]strin
 			return written, fmt.Errorf("reading ini %s: %w", pr.src, err)
 		}
 		content, removedLoaders := ini.StripXdebugLoaders(string(data))
-		content, commentedLoaders := ini.CommentExtensionLoaders(content)
+		var commentedLoaders []string
+		if cfg.commentOtherLoaders {
+			content, commentedLoaders = ini.CommentExtensionLoaders(content)
+		}
 		if stripModes {
 			content, _, _ = ini.SanitizeXdebugMode(content)
 		}
+		if cfg.skipUnchanged && content == string(data) {
+			continue
+		}
 
-		if err := registerConfigUndo(pr.dst, rb); err != nil {
+		if err := registerFileRestore(pr.dst, rb, 0o644); err != nil {
 			return written, err
 		}
 		if err := os.MkdirAll(filepath.Dir(pr.dst), 0o755); err != nil {
@@ -57,15 +67,36 @@ func copyConfig(existing, target *php.Info, rb *rollback, opts Options) ([]strin
 			return written, fmt.Errorf("writing ini %s: %w", pr.dst, err)
 		}
 		written = append(written, pr.dst)
-		opts.logf("  wrote %s%s", pr.dst, loaderNote(len(removedLoaders), len(commentedLoaders)))
+		opts.logf("  %s%s", pr.dst, loaderNote(len(removedLoaders), len(commentedLoaders)))
 	}
 	return written, nil
 }
 
-// configPairs builds the (source, destination) list: the existing main php.ini
-// goes to the new interpreter's ConfigPath, and each additional .ini goes to its
-// ScanDir (by base name).
-func configPairs(existing, target *php.Info) []configPair {
+// copyConfig copies the existing interpreter's ini files into the new
+// interpreter's compiled-in config path (so the new php loads the same
+// configuration), sanitizing each on the way. Returns the destination files.
+func copyConfig(existing, target *php.Info, rb *rollback, opts Options) ([]string, error) {
+	pairs := interpreterConfigPairs(existing, target)
+	if len(pairs) == 0 {
+		if target.Ini.ConfigPath == "" && target.Ini.ScanDir == "" {
+			opts.logf("Note: the interpreter reports no config path; skipping ini copy.")
+		}
+		return nil, nil
+	}
+	return rewriteIniFiles(pairs, iniRewriteOptions{commentOtherLoaders: true}, rb, opts)
+}
+
+// sanitizeInPlace applies the xdebug ini rules to the given existing ini files
+// in place (used by the extension flow to disable a real xdebug). Only files the
+// rules change are touched.
+func sanitizeInPlace(files []string, rb *rollback, opts Options) error {
+	_, err := rewriteIniFiles(inPlacePairs(files), iniRewriteOptions{skipUnchanged: true}, rb, opts)
+	return err
+}
+
+// interpreterConfigPairs maps the existing main php.ini to the new interpreter's
+// ConfigPath, and each additional .ini to its ScanDir (by base name).
+func interpreterConfigPairs(existing, target *php.Info) []configPair {
 	var pairs []configPair
 	if existing.Ini.LoadedFile != "" && target.Ini.ConfigPath != "" {
 		pairs = append(pairs, configPair{
@@ -80,6 +111,15 @@ func configPairs(existing, target *php.Info) []configPair {
 				dst: filepath.Join(target.Ini.ScanDir, filepath.Base(f)),
 			})
 		}
+	}
+	return pairs
+}
+
+// inPlacePairs turns a list of files into src==dst pairs for in-place rewriting.
+func inPlacePairs(files []string) []configPair {
+	pairs := make([]configPair, 0, len(files))
+	for _, f := range files {
+		pairs = append(pairs, configPair{src: f, dst: f})
 	}
 	return pairs
 }
@@ -111,15 +151,15 @@ func decideStripModes(pairs []configPair, opts Options) (bool, error) {
 		strings.Join(disallowed, ", "))), nil
 }
 
-// registerConfigUndo records how to undo writing dst: restore its prior contents
-// if it existed, otherwise remove it on rollback.
-func registerConfigUndo(dst string, rb *rollback) error {
-	if prev, err := os.ReadFile(dst); err == nil {
-		rb.add(func() error { return os.WriteFile(dst, prev, 0o644) })
+// registerFileRestore records how to undo writing path: restore its prior
+// contents (with perm) if it existed, otherwise remove it on rollback.
+func registerFileRestore(path string, rb *rollback, perm os.FileMode) error {
+	if prev, err := os.ReadFile(path); err == nil {
+		rb.add(func() error { return os.WriteFile(path, prev, perm) })
 	} else if os.IsNotExist(err) {
-		rb.add(func() error { return removeIfExists(dst) })
+		rb.add(func() error { return removeIfExists(path) })
 	} else {
-		return fmt.Errorf("inspecting %s: %w", dst, err)
+		return fmt.Errorf("inspecting %s: %w", path, err)
 	}
 	return nil
 }
@@ -131,7 +171,8 @@ func removeIfExists(path string) error {
 	return nil
 }
 
-// loaderNote summarizes what happened to extension loaders in a copied ini file.
+// loaderNote summarizes what happened to extension loaders in a rewritten ini
+// file, e.g. " (removed 1 xdebug loader(s), commented 2 extension loader(s))".
 func loaderNote(removed, commented int) string {
 	var parts []string
 	if removed > 0 {

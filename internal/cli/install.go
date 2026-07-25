@@ -30,18 +30,18 @@ func newInstallCmd() *cobra.Command {
 			"into the currently active PHP.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if opts.ExtensionOnly {
-				// Extension-only install is implemented in a later step.
-				return errNotImplemented("extension install")
-			}
-			return installer.InstallInterpreter(cmd.Context(), installer.Options{
+			o := installer.Options{
 				Scope:      platform.ScopeFromUserFlag(globalOpts.User),
 				PHPVersion: opts.PHPVersion,
 				ZTS:        opts.ZTS,
 				AssumeYes:  globalOpts.Yes,
 				Out:        cmd.OutOrStdout(),
 				In:         cmd.InOrStdin(),
-			})
+			}
+			if opts.ExtensionOnly {
+				return installer.InstallExtension(cmd.Context(), o)
+			}
+			return installer.InstallInterpreter(cmd.Context(), o)
 		},
 	}
 
