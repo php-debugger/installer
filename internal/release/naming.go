@@ -162,6 +162,9 @@ func LatestSeries(assets []Asset, kind Kind, zts bool, osID platform.OS, arch pl
 	return best, nil
 }
 
+// CompareSeries compares two dotted version strings numerically (-1, 0, 1).
+func CompareSeries(a, b string) int { return compareSeries(a, b) }
+
 // compareSeries compares two dotted version strings numerically. Returns -1, 0
 // or 1. Non-numeric fields sort as 0.
 func compareSeries(a, b string) int {
