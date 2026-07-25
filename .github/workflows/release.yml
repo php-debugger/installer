@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  release:
+    # Runs when you publish a release in GitHub (draft -> published, or a new
+    # published release). The release already exists, so we just attach binaries.
+    types: [published]
+
+permissions:
+  contents: write # needed to upload release assets
+
+jobs:
+  release:
+    name: Build & attach binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build all targets
+        run: |
+          mkdir -p dist
+          # Windows-on-ARM runs x64 under emulation, so one Windows build suffices.
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"
+            ext=""; [ "$os" = "windows" ] && ext=".exe"
+            out="dist/php-debugger-${os}-${arch}${ext}"
+            echo "building $out"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w" -o "$out" .
+          done
+          ls -la dist
+
+      - name: Attach binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/* --clobber
