@@ -53,8 +53,10 @@ exit 0
 `, version, modules, cfgDir, scanDir, version, series)
 }
 
-// newFakeReleaseServer serves a latest-release payload pointing at a single
-// interpreter asset whose bytes are the given fake php script.
+const fakeSO = "FAKE-DEBUGGER-SO-BYTES"
+
+// newFakeReleaseServer serves a latest-release payload with both an interpreter
+// asset (bytes = phpScript) and an extension asset (bytes = fakeSO).
 func newFakeReleaseServer(t *testing.T, phpScript string) *httptest.Server {
 	t.Helper()
 	var srv *httptest.Server
@@ -62,10 +64,13 @@ func newFakeReleaseServer(t *testing.T, phpScript string) *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
 			fmt.Fprintf(w, `{"tag_name":"9.9.9","assets":[
-				{"name":"php-php8.3-nts-linux-x86_64","browser_download_url":%q,"size":%d}
-			]}`, srv.URL+"/dl/php", len(phpScript))
+				{"name":"php-php8.3-nts-linux-x86_64","browser_download_url":%q,"size":%d},
+				{"name":"php-debugger-php8.3-nts-linux-x86_64.so","browser_download_url":%q,"size":%d}
+			]}`, srv.URL+"/dl/php", len(phpScript), srv.URL+"/dl/ext", len(fakeSO))
 		case r.URL.Path == "/dl/php":
 			w.Write([]byte(phpScript))
+		case r.URL.Path == "/dl/ext":
+			w.Write([]byte(fakeSO))
 		default:
 			http.NotFound(w, r)
 		}
