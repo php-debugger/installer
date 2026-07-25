@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
+	"github.com/php-debugger/installer/internal/php"
 	"github.com/php-debugger/installer/internal/platform"
 	"github.com/php-debugger/installer/internal/release"
 	"github.com/spf13/cobra"
@@ -90,5 +92,33 @@ func runResolve(cmd *cobra.Command, opts *resolveOptions) error {
 	if asset.Size > 0 {
 		fmt.Fprintf(out, "size:      %.1f MiB\n", float64(asset.Size)/(1024*1024))
 	}
+
+	printExistingPHP(ctx, out)
 	return nil
+}
+
+// printExistingPHP prints facts about the php interpreter currently on PATH, for
+// diagnostics. It never fails the command.
+func printExistingPHP(ctx context.Context, out io.Writer) {
+	path, err := php.Detect()
+	if err != nil {
+		fmt.Fprintf(out, "existing:  none on PATH\n")
+		return
+	}
+	info, err := php.Query(ctx, path)
+	if err != nil {
+		fmt.Fprintf(out, "existing:  %s (could not query: %v)\n", path, err)
+		return
+	}
+	loaded := info.Ini.LoadedFile
+	if loaded == "" {
+		loaded = "(none)"
+	}
+	fmt.Fprintf(out, "existing:  %s\n", info.Path)
+	fmt.Fprintf(out, "  version:       %s (series %s, zts=%t)\n", info.Version, info.Series, info.ZTS)
+	fmt.Fprintf(out, "  loaded ini:    %s\n", loaded)
+	fmt.Fprintf(out, "  extension_dir: %s\n", info.ExtensionDir)
+	if len(info.Ini.AdditionalFiles) > 0 {
+		fmt.Fprintf(out, "  extra ini:     %d file(s)\n", len(info.Ini.AdditionalFiles))
+	}
 }
