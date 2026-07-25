@@ -19,8 +19,16 @@ import (
 var ErrNotFound = errors.New("no php interpreter found on PATH")
 
 // DebuggerModule is the module name the php-debugger extension registers, as
-// reported by `php -m`. Install verification checks for it via HasModule.
-const DebuggerModule = "php-debugger"
+// reported by `php -m`. Confirmed against release 0.1.0: the interpreter lists
+// "php_debugger" under [PHP Modules] (and "PHP Debugger" under [Zend Modules]).
+//
+// The extension also exposes a *simulated* "xdebug" module for compatibility
+// with tooling that probes for xdebug. We therefore verify against
+// "php_debugger" specifically — checking for "xdebug" would be ambiguous, since
+// a host with real xdebug (but not our debugger) would match it too.
+//
+// Install verification checks for it via HasModule (case-insensitive).
+const DebuggerModule = "php_debugger"
 
 // Info describes a PHP interpreter.
 type Info struct {

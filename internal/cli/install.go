@@ -1,6 +1,10 @@
 package cli
 
-import "github.com/spf13/cobra"
+import (
+	"github.com/php-debugger/installer/internal/installer"
+	"github.com/php-debugger/installer/internal/platform"
+	"github.com/spf13/cobra"
+)
 
 // installOptions holds flags specific to the install command.
 type installOptions struct {
@@ -26,7 +30,17 @@ func newInstallCmd() *cobra.Command {
 			"into the currently active PHP.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return errNotImplemented("install")
+			if opts.ExtensionOnly {
+				// Extension-only install is implemented in a later step.
+				return errNotImplemented("extension install")
+			}
+			return installer.InstallInterpreter(cmd.Context(), installer.Options{
+				Scope:      platform.ScopeFromUserFlag(globalOpts.User),
+				PHPVersion: opts.PHPVersion,
+				ZTS:        opts.ZTS,
+				AssumeYes:  globalOpts.Yes,
+				Out:        cmd.OutOrStdout(),
+			})
 		},
 	}
 
