@@ -4,6 +4,9 @@ import "strings"
 
 // IniPaths captures the ini file locations reported by `php --ini`.
 type IniPaths struct {
+	// ConfigPath is the directory php looks in for its main php.ini (the
+	// "Configuration File (php.ini) Path"). This is compiled into the binary.
+	ConfigPath string
 	// LoadedFile is the main php.ini actually loaded ("" if none).
 	LoadedFile string
 	// ScanDir is the directory scanned for additional .ini files ("" if none).
@@ -36,6 +39,8 @@ func parseIniOutput(out string) IniPaths {
 	lines := strings.Split(out, "\n")
 	for i, ln := range lines {
 		switch {
+		case strings.HasPrefix(ln, "Configuration File (php.ini) Path:"):
+			p.ConfigPath = cleanIniValue(afterColon(ln))
 		case strings.HasPrefix(ln, "Loaded Configuration File:"):
 			p.LoadedFile = cleanIniValue(afterColon(ln))
 		case strings.HasPrefix(ln, "Scan for additional .ini files in:"):
@@ -89,9 +94,10 @@ func afterColon(s string) string {
 	return s
 }
 
-// cleanIniValue trims a value and normalizes PHP's "(none)" placeholder to "".
+// cleanIniValue trims a value, strips surrounding double quotes (newer PHP quotes
+// these paths) and normalizes PHP's "(none)" placeholder to "".
 func cleanIniValue(s string) string {
-	s = strings.TrimSpace(s)
+	s = unquotePath(strings.TrimSpace(s))
 	if s == "(none)" {
 		return ""
 	}
@@ -99,15 +105,23 @@ func cleanIniValue(s string) string {
 }
 
 // parseFileList splits a comma/whitespace separated list of file paths, dropping
-// empties and "(none)".
+// empties and "(none)", stripping surrounding quotes on each entry.
 func parseFileList(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
+		part = unquotePath(strings.TrimSpace(part))
 		if part == "" || part == "(none)" {
 			continue
 		}
 		out = append(out, part)
 	}
 	return out
+}
+
+// unquotePath removes a single pair of surrounding double quotes, then trims.
+func unquotePath(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+	}
+	return strings.TrimSpace(s)
 }

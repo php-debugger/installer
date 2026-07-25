@@ -4,11 +4,13 @@
 package installer
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/php-debugger/installer/internal/manifest"
@@ -26,6 +28,9 @@ type Options struct {
 
 	// Out receives human-readable progress output (may be nil).
 	Out io.Writer
+	// In is read for interactive confirmations (defaults to os.Stdin via the CLI;
+	// may be nil, in which case prompts default to "no" unless AssumeYes).
+	In io.Reader
 
 	// Client and Env are optional overrides for testing. When nil, real ones are
 	// constructed.
@@ -55,10 +60,28 @@ func (o Options) clock() time.Time {
 	return time.Now().UTC()
 }
 
+// confirm asks the user a yes/no question. Returns true under --yes; otherwise
+// reads a line from In (defaulting to "no" if there is no input).
+func (o Options) confirm(question string) bool {
+	if o.AssumeYes {
+		return true
+	}
+	if o.In == nil {
+		return false
+	}
+	if o.Out != nil {
+		fmt.Fprintf(o.Out, "%s [y/N]: ", question)
+	}
+	line, _ := bufio.NewReader(o.In).ReadString('\n')
+	line = strings.ToLower(strings.TrimSpace(line))
+	return line == "y" || line == "yes"
+}
+
 // InstallInterpreter installs a self-contained PHP interpreter with the debugger
-// compiled in, and activates it. This is the clean-host path: it does not yet
-// detect or back up a pre-existing interpreter (that is layered on in a later
-// step). On any failure after the first filesystem change, it rolls back.
+// compiled in, and activates it. If an existing interpreter is found it is backed
+// up and replaced at its location, and its ini configuration is copied (minus
+// xdebug) into the new interpreter's config path. On any failure after the first
+// filesystem change, it rolls back.
 func InstallInterpreter(ctx context.Context, opts Options) error {
 	env, err := opts.env()
 	if err != nil {
@@ -70,16 +93,11 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	binDir, err := platform.SelectBinDir(layout.BinCandidates)
-	if err != nil {
-		return fmt.Errorf("%w\ntry --user for a per-user install, or re-run with elevated privileges", err)
-	}
 
 	client := opts.Client
 	if client == nil {
 		client = release.NewClient()
 	}
-
 	rel, err := client.LatestRelease(ctx)
 	if err != nil {
 		return err
@@ -92,7 +110,6 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 			return err
 		}
 	}
-
 	asset, err := release.SelectAsset(rel.Assets, release.Selector{
 		Kind:   release.Interpreter,
 		Series: series,
@@ -100,6 +117,17 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		OS:     p.OS,
 		Arch:   p.Arch,
 	})
+	if err != nil {
+		return err
+	}
+
+	// Detect a pre-existing interpreter before we change anything. Ignore one
+	// that is our own previous install (avoid backing up our own symlink).
+	existing := detectExisting(ctx, opts, layout.Root)
+
+	// Decide where the active `php` goes: replace the existing interpreter at its
+	// location when possible, else our scope's bin dir.
+	linkDir, replaceExisting, err := chooseLinkDir(existing, layout)
 	if err != nil {
 		return err
 	}
@@ -133,8 +161,9 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		return fmt.Errorf("querying downloaded interpreter: %w", err)
 	}
 
-	// --- place into the versioned directory ---
 	rb := &rollback{}
+
+	// --- place the binary into the versioned directory ---
 	versionDir := layout.VersionDir(series, opts.ZTS)
 	binTarget := filepath.Join(versionDir, "bin", phpBinaryName(p.OS))
 	if err := installFile(dlPath, binTarget); err != nil {
@@ -142,19 +171,46 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	}
 	rb.add(func() error { return os.RemoveAll(versionDir) })
 
-	// --- activate (symlink/shim into the bin dir) ---
-	prevTarget, _, hadPrev := platform.ReadActive(binDir, "php")
-	activePath, kind, err := platform.Activate(binDir, "php", binTarget)
+	// --- copy the existing interpreter's ini config into the new one ---
+	var configFiles []string
+	if existing != nil {
+		opts.logf("Copying existing PHP configuration (removing xdebug) ...")
+		configFiles, err = copyConfig(existing, info, rb, opts)
+		if err != nil {
+			rb.run()
+			return fmt.Errorf("copying ini configuration; rolled back: %w", err)
+		}
+	}
+
+	// --- back up and replace an existing interpreter at its location ---
+	var backup *manifest.Backup
+	if replaceExisting {
+		opts.logf("Backing up existing interpreter at %s ...", existing.Path)
+		backupPath, err := backupExisting(existing.Path, layout.BackupsDir(),
+			platform.VersionDirName(series, opts.ZTS), time.Now().UnixNano())
+		if err != nil {
+			rb.run()
+			return fmt.Errorf("backing up existing interpreter; rolled back: %w", err)
+		}
+		origPath := existing.Path
+		rb.add(func() error { return restoreBackup(backupPath, origPath) })
+		backup = &manifest.Backup{OriginalPath: origPath, BackupPath: backupPath, CreatedAt: opts.clock()}
+		maybeWarnManaged(opts, existing)
+	}
+
+	// --- activate (symlink into the chosen bin dir) ---
+	prevTarget, _, hadPrev := platform.ReadActive(linkDir, "php")
+	activePath, kind, err := platform.Activate(linkDir, "php", binTarget)
 	if err != nil {
 		rb.run()
-		return fmt.Errorf("activating interpreter: %w", err)
+		return fmt.Errorf("activating interpreter; rolled back: %w", err)
 	}
 	rb.add(func() error {
 		if hadPrev {
-			_, _, e := platform.Activate(binDir, "php", prevTarget)
+			_, _, e := platform.Activate(linkDir, "php", prevTarget)
 			return e
 		}
-		return platform.RemoveActive(binDir, "php")
+		return platform.RemoveActive(linkDir, "php")
 	})
 
 	// --- post-verify via the activated entry ---
@@ -182,7 +238,7 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	}
 	key := platform.VersionDirName(series, opts.ZTS)
 	m.InstallRoot = layout.Root
-	m.BinDir = binDir
+	m.BinDir = linkDir
 	m.SetInterpreter(key, manifest.Interpreter{
 		Series:      series,
 		PHPVersion:  info.Version,
@@ -190,16 +246,76 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		ReleaseTag:  rel.TagName,
 		Dir:         versionDir,
 		InstalledAt: opts.clock(),
+		ConfigFiles: configFiles,
 	})
 	m.SetActive(key)
+	if backup != nil {
+		m.SetBackup(key, *backup)
+	}
 	if err := m.Save(layout.ManifestPath()); err != nil {
 		rb.run()
 		return fmt.Errorf("saving manifest; rolled back: %w", err)
 	}
 
 	opts.logf("Installed php %s (%s). Active php -> %s", info.Version, kind, activePath)
-	warnIfNotOnPATH(opts, p.OS, binDir)
+	if !replaceExisting {
+		warnIfNotOnPATH(opts, p.OS, linkDir)
+	}
 	return nil
+}
+
+// detectExisting finds a pre-existing php on PATH and queries it. It returns nil
+// if none is found, if it cannot be queried, or if it is our own previous
+// install under root (which must not be treated as a foreign interpreter).
+func detectExisting(ctx context.Context, opts Options, root string) *php.Info {
+	path, err := php.Detect()
+	if err != nil {
+		return nil
+	}
+	if resolved, e := filepath.EvalSymlinks(path); e == nil && isUnderRoot(resolved, root) {
+		return nil // our own previously-installed interpreter
+	}
+	info, err := php.Query(ctx, path)
+	if err != nil {
+		opts.logf("Note: found php at %s but could not query it (%v); treating as clean host.", path, err)
+		return nil
+	}
+	return info
+}
+
+// chooseLinkDir decides where the active `php` entry goes. When an existing
+// interpreter is found and its directory is writable, we replace it in place;
+// otherwise we use the scope's first writable bin dir.
+func chooseLinkDir(existing *php.Info, layout platform.Layout) (dir string, replace bool, err error) {
+	if existing != nil {
+		d := filepath.Dir(existing.Path)
+		if platform.IsDirWritable(d) {
+			return d, true, nil
+		}
+	}
+	binDir, err := platform.SelectBinDir(layout.BinCandidates)
+	if err != nil {
+		return "", false, fmt.Errorf("%w\ntry --user for a per-user install, or re-run with elevated privileges", err)
+	}
+	return binDir, false, nil
+}
+
+func isUnderRoot(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// maybeWarnManaged warns when the replaced interpreter appears to be managed by a
+// package manager (e.g. Homebrew), since a future upgrade may recreate it.
+func maybeWarnManaged(opts Options, existing *php.Info) {
+	target, _ := filepath.EvalSymlinks(existing.Path)
+	low := strings.ToLower(existing.Path + " " + target)
+	if strings.Contains(low, "cellar") || strings.Contains(low, "homebrew") {
+		opts.logf("Note: %s looks package-manager-managed; a future upgrade (e.g. `brew upgrade`) may recreate it and shadow this install.", existing.Path)
+	}
 }
 
 func threading(zts bool) string {
