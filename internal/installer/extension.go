@@ -49,17 +49,20 @@ func InstallExtension(ctx context.Context, opts Options) error {
 		return fmt.Errorf("php at %s reports no extension_dir; cannot install the extension", path)
 	}
 
-	// Nothing to do if the debugger is already present (e.g. our own interpreter).
-	if has, _ := php.HasModule(ctx, path, php.DebuggerModule); has {
-		opts.logf("%s already has the %s module; nothing to do.", path, php.DebuggerModule)
-		return nil
+	// Nothing to do if the debugger is already present (e.g. our own
+	// interpreter), unless forced (as by `update`).
+	if !opts.Force {
+		if has, _ := php.HasModule(ctx, path, php.DebuggerModule); has {
+			opts.logf("%s already has the %s module; nothing to do.", path, php.DebuggerModule)
+			return nil
+		}
 	}
 
 	client := opts.Client
 	if client == nil {
 		client = release.NewClient()
 	}
-	rel, err := client.LatestRelease(ctx)
+	rel, err := opts.latestRelease(ctx, client)
 	if err != nil {
 		return err
 	}
