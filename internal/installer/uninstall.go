@@ -73,12 +73,14 @@ func uninstallInterpreter(opts Options, layout platform.Layout, m *manifest.Mani
 	}
 	wasActive := m.Active() == key
 
-	// Remove the copied config files, then the versioned directory.
+	// Remove the copied config files (and prune the dirs they lived in if now
+	// empty), then the versioned directory.
 	for _, f := range it.ConfigFiles {
 		if err := removeIfExists(f); err != nil {
 			return fmt.Errorf("removing config %s: %w", f, err)
 		}
 	}
+	pruneEmptyConfigDirs(it.ConfigFiles)
 	if err := os.RemoveAll(it.Dir); err != nil {
 		return fmt.Errorf("removing %s: %w", it.Dir, err)
 	}
@@ -96,7 +98,7 @@ func uninstallInterpreter(opts Options, layout platform.Layout, m *manifest.Mani
 		}
 	}
 
-	if err := m.Save(layout.ManifestPath()); err != nil {
+	if err := finalizeManifest(layout, m); err != nil {
 		return fmt.Errorf("saving manifest: %w", err)
 	}
 	opts.logf("Uninstalled interpreter php %s (%s).", it.Series, threading(it.ZTS))
@@ -154,7 +156,7 @@ func uninstallExtension(opts Options, layout platform.Layout, m *manifest.Manife
 		}
 	}
 	m.ClearExtension()
-	if err := m.Save(layout.ManifestPath()); err != nil {
+	if err := finalizeManifest(layout, m); err != nil {
 		return fmt.Errorf("saving manifest: %w", err)
 	}
 	opts.logf("Uninstalled the php-debugger extension for php %s.", ext.Series)
