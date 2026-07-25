@@ -37,12 +37,28 @@ type Options struct {
 	// `switch` so a newly installed variant activates where the current one lives.
 	BinDir string
 
+	// Force skips "nothing to do" short-circuits (used by `update` to reinstall
+	// even when the debugger is already present).
+	Force bool
+
 	// Client and Env are optional overrides for testing. When nil, real ones are
 	// constructed.
 	Client *release.Client
 	Env    *platform.Env
 
+	// preloadedRelease, when set, is used instead of fetching the latest release
+	// (so `update` can fetch once to compare versions, then reuse it).
+	preloadedRelease *release.Release
+
 	now func() time.Time // optional clock override for tests
+}
+
+// latestRelease returns the preloaded release if set, otherwise fetches it.
+func (o Options) latestRelease(ctx context.Context, client *release.Client) (*release.Release, error) {
+	if o.preloadedRelease != nil {
+		return o.preloadedRelease, nil
+	}
+	return client.LatestRelease(ctx)
 }
 
 func (o Options) logf(format string, args ...any) {
@@ -103,7 +119,7 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	if client == nil {
 		client = release.NewClient()
 	}
-	rel, err := client.LatestRelease(ctx)
+	rel, err := opts.latestRelease(ctx, client)
 	if err != nil {
 		return err
 	}
@@ -171,10 +187,24 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	// --- place the binary into the versioned directory ---
 	versionDir := layout.VersionDir(series, opts.ZTS)
 	binTarget := filepath.Join(versionDir, "bin", phpBinaryName(p.OS))
+	// If the version dir already exists (an update/reinstall), preserve the old
+	// binary so a failed install can be rolled back to a working state; else the
+	// whole fresh dir is removed on rollback.
+	versionExisted := isDir(versionDir)
+	if versionExisted {
+		if err := registerFileRestore(binTarget, rb, 0o755); err != nil {
+			return err
+		}
+	}
 	if err := installFile(dlPath, binTarget); err != nil {
+		if !versionExisted {
+			os.RemoveAll(versionDir)
+		}
 		return fmt.Errorf("installing interpreter binary: %w", err)
 	}
-	rb.add(func() error { return os.RemoveAll(versionDir) })
+	if !versionExisted {
+		rb.add(func() error { return os.RemoveAll(versionDir) })
+	}
 
 	// --- copy the existing interpreter's ini config into the new one ---
 	var configFiles []string
@@ -325,6 +355,11 @@ func maybeWarnManaged(opts Options, existing *php.Info) {
 	if strings.Contains(low, "cellar") || strings.Contains(low, "homebrew") {
 		opts.logf("Note: %s looks package-manager-managed; a future upgrade (e.g. `brew upgrade`) may recreate it and shadow this install.", existing.Path)
 	}
+}
+
+func isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 func threading(zts bool) string {
