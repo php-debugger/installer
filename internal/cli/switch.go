@@ -1,6 +1,10 @@
 package cli
 
-import "github.com/spf13/cobra"
+import (
+	"github.com/php-debugger/installer/internal/installer"
+	"github.com/php-debugger/installer/internal/platform"
+	"github.com/spf13/cobra"
+)
 
 // switchOptions holds flags specific to the switch command.
 type switchOptions struct {
@@ -19,7 +23,14 @@ func newSwitchCmd() *cobra.Command {
 			"first.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return errNotImplemented("switch")
+			return installer.Switch(cmd.Context(), installer.Options{
+				Scope:      platform.ScopeFromUserFlag(globalOpts.User),
+				PHPVersion: args[0],
+				ZTS:        opts.ZTS,
+				AssumeYes:  globalOpts.Yes,
+				Out:        cmd.OutOrStdout(),
+				In:         cmd.InOrStdin(),
+			})
 		},
 	}
 

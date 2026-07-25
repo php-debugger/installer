@@ -32,6 +32,11 @@ type Options struct {
 	// may be nil, in which case prompts default to "no" unless AssumeYes).
 	In io.Reader
 
+	// BinDir, when set, forces the active `php` to be placed in this directory
+	// instead of auto-choosing (replace-existing or scope bin dir). Used by
+	// `switch` so a newly installed variant activates where the current one lives.
+	BinDir string
+
 	// Client and Env are optional overrides for testing. When nil, real ones are
 	// constructed.
 	Client *release.Client
@@ -127,7 +132,7 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 
 	// Decide where the active `php` goes: replace the existing interpreter at its
 	// location when possible, else our scope's bin dir.
-	linkDir, replaceExisting, err := chooseLinkDir(existing, layout)
+	linkDir, replaceExisting, err := chooseLinkDir(existing, layout, opts.BinDir)
 	if err != nil {
 		return err
 	}
@@ -283,10 +288,14 @@ func detectExisting(ctx context.Context, opts Options, root string) *php.Info {
 	return info
 }
 
-// chooseLinkDir decides where the active `php` entry goes. When an existing
-// interpreter is found and its directory is writable, we replace it in place;
-// otherwise we use the scope's first writable bin dir.
-func chooseLinkDir(existing *php.Info, layout platform.Layout) (dir string, replace bool, err error) {
+// chooseLinkDir decides where the active `php` entry goes. An explicit override
+// (from `switch`) wins. Otherwise, when an existing interpreter is found and its
+// directory is writable, we replace it in place; else we use the scope's first
+// writable bin dir.
+func chooseLinkDir(existing *php.Info, layout platform.Layout, override string) (dir string, replace bool, err error) {
+	if override != "" {
+		return override, false, nil
+	}
 	if existing != nil {
 		d := filepath.Dir(existing.Path)
 		if platform.IsDirWritable(d) {
