@@ -80,6 +80,45 @@ func TestStripXdebugLoaders(t *testing.T) {
 	}
 }
 
+func TestCommentExtensionLoaders(t *testing.T) {
+	tests := []struct {
+		name          string
+		in            string
+		want          string
+		wantCommented []string
+	}{
+		{
+			name:          "comments active extension and zend_extension",
+			in:            "extension=mysqli.so\nzend_extension=/opt/opcache.so\nmemory_limit=256M\n",
+			want:          "; extension=mysqli.so\n; zend_extension=/opt/opcache.so\nmemory_limit=256M\n",
+			wantCommented: []string{"extension=mysqli.so", "zend_extension=/opt/opcache.so"},
+		},
+		{
+			name:          "leaves already-commented and non-loaders alone",
+			in:            ";extension=foo.so\ndisplay_errors=On\n",
+			want:          ";extension=foo.so\ndisplay_errors=On\n",
+			wantCommented: nil,
+		},
+		{
+			name:          "preserves CRLF",
+			in:            "extension=mysqli.so\r\nmemory_limit=256M\r\n",
+			want:          "; extension=mysqli.so\r\nmemory_limit=256M\r\n",
+			wantCommented: []string{"extension=mysqli.so"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, commented := CommentExtensionLoaders(tt.in)
+			if got != tt.want {
+				t.Errorf("content = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(commented, tt.wantCommented) {
+				t.Errorf("commented = %#v, want %#v", commented, tt.wantCommented)
+			}
+		})
+	}
+}
+
 func TestDisallowedModes(t *testing.T) {
 	tests := []struct {
 		name string

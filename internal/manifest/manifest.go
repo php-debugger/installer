@@ -41,6 +41,10 @@ type Interpreter struct {
 	ReleaseTag  string    `json:"releaseTag"`
 	Dir         string    `json:"dir"` // absolute install directory
 	InstalledAt time.Time `json:"installedAt"`
+	// ConfigFiles are ini files this install wrote into the interpreter's
+	// compiled-in config path (copied from a replaced interpreter), recorded so
+	// uninstall can remove them.
+	ConfigFiles []string `json:"configFiles,omitempty"`
 }
 
 // Backup records an interpreter that was replaced during an install, so it can

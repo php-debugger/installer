@@ -39,6 +39,7 @@ Additional .ini files parsed:      /etc/php/8.3/cli/conf.d/10-opcache.ini,
 `
 	got := parseIniOutput(out)
 	want := IniPaths{
+		ConfigPath: "/etc/php/8.3/cli",
 		LoadedFile: "/etc/php/8.3/cli/php.ini",
 		ScanDir:    "/etc/php/8.3/cli/conf.d",
 		AdditionalFiles: []string{
@@ -49,6 +50,28 @@ Additional .ini files parsed:      /etc/php/8.3/cli/conf.d/10-opcache.ini,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseIniOutput =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+func TestParseIniOutputQuotedPaths(t *testing.T) {
+	// Newer PHP (e.g. 8.5) quotes the paths in --ini output.
+	out := `Configuration File (php.ini) Path: "/opt/homebrew/etc/php/8.5"
+Loaded Configuration File:         "/opt/homebrew/etc/php/8.5/php.ini"
+Scan for additional .ini files in: "/opt/homebrew/etc/php/8.5/conf.d"
+Additional .ini files parsed:      "/opt/homebrew/etc/php/8.5/conf.d/20-debug.ini"
+`
+	got := parseIniOutput(out)
+	if got.ConfigPath != "/opt/homebrew/etc/php/8.5" {
+		t.Errorf("ConfigPath = %q", got.ConfigPath)
+	}
+	if got.LoadedFile != "/opt/homebrew/etc/php/8.5/php.ini" {
+		t.Errorf("LoadedFile = %q", got.LoadedFile)
+	}
+	if got.ScanDir != "/opt/homebrew/etc/php/8.5/conf.d" {
+		t.Errorf("ScanDir = %q", got.ScanDir)
+	}
+	if len(got.AdditionalFiles) != 1 || got.AdditionalFiles[0] != "/opt/homebrew/etc/php/8.5/conf.d/20-debug.ini" {
+		t.Errorf("AdditionalFiles = %v", got.AdditionalFiles)
 	}
 }
 

@@ -40,6 +40,7 @@ func newInstallCmd() *cobra.Command {
 				ZTS:        opts.ZTS,
 				AssumeYes:  globalOpts.Yes,
 				Out:        cmd.OutOrStdout(),
+				In:         cmd.InOrStdin(),
 			})
 		},
 	}

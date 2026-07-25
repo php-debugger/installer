@@ -33,6 +33,33 @@ func StripXdebugLoaders(content string) (string, []string) {
 	return strings.Join(kept, "\n"), removed
 }
 
+// CommentExtensionLoaders comments out every active extension= / zend_extension=
+// directive by prefixing it with "; ", returning the rewritten content and the
+// list of lines that were commented. Already-commented loaders and non-loader
+// lines are left unchanged.
+//
+// This is used when copying an existing php's config to a self-contained
+// debugger interpreter, which cannot load foreign .so files (they are built for
+// a specific PHP ABI). Commenting keeps them visible but inert. Note xdebug
+// loaders are removed entirely by StripXdebugLoaders and never reach here.
+func CommentExtensionLoaders(content string) (string, []string) {
+	lines := strings.Split(content, "\n")
+	var commented []string
+	for i, ln := range lines {
+		isComment, key, _, ok := parseDirective(ln)
+		if !ok || isComment || (key != "extension" && key != "zend_extension") {
+			continue
+		}
+		commented = append(commented, strings.TrimRight(ln, "\r"))
+		body, cr := ln, ""
+		if strings.HasSuffix(body, "\r") {
+			body, cr = body[:len(body)-1], "\r"
+		}
+		lines[i] = "; " + body + cr
+	}
+	return strings.Join(lines, "\n"), commented
+}
+
 // DisallowedModes returns the de-duplicated set of xdebug.mode tokens present in
 // xdebug.mode directives (active or commented out) that are not in AllowedModes,
 // preserving first-seen order. It is empty if xdebug.mode is absent or already
