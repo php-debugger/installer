@@ -7,7 +7,34 @@ pulls the **latest release** and auto-detects your OS and architecture.
 
 ## Installation
 
-Build from source (Go 1.25+):
+### Download a prebuilt binary
+
+Grab the archive for your platform from the
+[Releases page](https://github.com/php-debugger/installer/releases):
+
+| Platform | Asset |
+| --- | --- |
+| macOS (Apple Silicon) | `php-debugger-macos-arm64.tar.gz` |
+| macOS (Intel) | `php-debugger-macos-amd64.tar.gz` |
+| Linux (x86_64) | `php-debugger-linux-amd64.tar.gz` |
+| Linux (arm64) | `php-debugger-linux-arm64.tar.gz` |
+| Windows (x64) | `php-debugger-windows-amd64.zip` |
+
+On macOS/Linux, extract **in the terminal** (not by double-clicking in Finder).
+Command-line `tar` keeps the executable bit and avoids macOS Gatekeeper flagging
+the binary — no `chmod` or "allow anyway" needed:
+
+```bash
+tar -xzf php-debugger-macos-arm64.tar.gz
+mv php-debugger /usr/local/bin/    # or ~/.local/bin
+php-debugger --help
+```
+
+On Windows, unzip the archive and put `php-debugger.exe` somewhere on your PATH.
+
+### Build from source
+
+Requires Go 1.25+:
 
 ```bash
 go build -o php-debugger .
