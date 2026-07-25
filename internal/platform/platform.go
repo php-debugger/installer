@@ -80,7 +80,14 @@ func DetectFor(goos, goarch string) (Platform, error) {
 	return Platform{OS: osID, Arch: arch}, nil
 }
 
-// Detect resolves the Platform of the host the installer is running on.
+// Detect resolves the Platform of the host the installer is running on. It
+// corrects the architecture to the machine's native one when the tool is running
+// emulated (an amd64 build on Apple Silicon), so we install native binaries.
 func Detect() (Platform, error) {
-	return DetectFor(runtime.GOOS, runtime.GOARCH)
+	p, err := DetectFor(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return Platform{}, err
+	}
+	p.Arch = detectNativeArch(p.OS, p.Arch, sysctlInt)
+	return p, nil
 }
