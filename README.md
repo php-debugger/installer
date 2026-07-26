@@ -7,9 +7,28 @@ pulls the **latest release** and auto-detects your OS and architecture.
 
 ## Installation
 
+### Install script (recommended)
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://github.com/php-debugger/installer/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -c "irm https://github.com/php-debugger/installer/releases/latest/download/install.ps1 | iex"
+```
+
+The script detects your OS/arch, downloads the right archive, and installs the
+binary (into the current directory by default; set `INSTALL_DIR` to change it, or
+`VERSION` to pin a release). Because it fetches with `curl`/`wget` rather than a
+browser, the binary is **not quarantined**, so macOS Gatekeeper doesn't block it.
+
 ### Download a prebuilt binary
 
-Grab the archive for your platform from the
+Alternatively, grab the archive for your platform from the
 [Releases page](https://github.com/php-debugger/installer/releases):
 
 | Platform | Asset |
@@ -20,14 +39,20 @@ Grab the archive for your platform from the
 | Linux (arm64) | `php-debugger-linux-arm64.tar.gz` |
 | Windows (x64) | `php-debugger-windows-amd64.zip` |
 
-On macOS/Linux, extract **in the terminal** (not by double-clicking in Finder).
-Command-line `tar` keeps the executable bit and avoids macOS Gatekeeper flagging
-the binary — no `chmod` or "allow anyway" needed:
+Extract it (command-line `tar` keeps the executable bit) and put it on your PATH:
 
 ```bash
 tar -xzf php-debugger-macos-arm64.tar.gz
 mv php-debugger /usr/local/bin/    # or ~/.local/bin
 php-debugger --help
+```
+
+On macOS, a binary downloaded through a **browser** is quarantined, so Gatekeeper
+shows "Apple could not verify…". These builds are ad-hoc signed but not notarized,
+so clear the quarantine flag once (the install script above avoids this entirely):
+
+```bash
+xattr -d com.apple.quarantine ./php-debugger
 ```
 
 On Windows, unzip the archive and put `php-debugger.exe` somewhere on your PATH.
