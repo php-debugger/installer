@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/php-debugger/installer/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -27,6 +28,7 @@ func newRootCmd() *cobra.Command {
 		Long: "php-debugger installs the PHP debugger from the php-debugger/php-debugger\n" +
 			"GitHub releases: either a self-contained PHP interpreter with the debugger\n" +
 			"compiled in (default), or the debugger extension for an existing PHP.",
+		Version:       version.Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -45,6 +47,7 @@ func newRootCmd() *cobra.Command {
 		newUninstallCmd(),
 		newSwitchCmd(),
 		newResolveCmd(),
+		newVersionCmd(),
 	)
 
 	return rootCmd
