@@ -119,6 +119,51 @@ func TestCommentExtensionLoaders(t *testing.T) {
 	}
 }
 
+func TestStripPhpDebuggerLoaders(t *testing.T) {
+	tests := []struct {
+		name        string
+		in          string
+		want        string
+		wantRemoved []string
+	}{
+		{
+			name:        "removes the php-debugger zend_extension loader",
+			in:          "zend_extension=/usr/lib/php/ext/php-debugger-php8.3-nts-linux-x86_64.so\nmemory_limit=256M\n",
+			want:        "memory_limit=256M\n",
+			wantRemoved: []string{"zend_extension=/usr/lib/php/ext/php-debugger-php8.3-nts-linux-x86_64.so"},
+		},
+		{
+			name:        "accepts the underscore spelling and removes commented loaders too",
+			in:          "; zend_extension=php_debugger.so\n",
+			want:        "",
+			wantRemoved: []string{"; zend_extension=php_debugger.so"},
+		},
+		{
+			name:        "ignores extension= (loads only via zend_extension)",
+			in:          "extension=php-debugger.so\n",
+			want:        "extension=php-debugger.so\n",
+			wantRemoved: nil,
+		},
+		{
+			name:        "leaves unrelated loaders alone",
+			in:          "zend_extension=xdebug.so\nextension=mysqli.so\n",
+			want:        "zend_extension=xdebug.so\nextension=mysqli.so\n",
+			wantRemoved: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, removed := StripPhpDebuggerLoaders(tt.in)
+			if got != tt.want {
+				t.Errorf("content = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(removed, tt.wantRemoved) {
+				t.Errorf("removed = %#v, want %#v", removed, tt.wantRemoved)
+			}
+		})
+	}
+}
+
 func TestDisallowedModes(t *testing.T) {
 	tests := []struct {
 		name string

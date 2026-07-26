@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,6 +22,13 @@ import (
 // the loader ini exists AND simulateLoad is true — mimicking dynamic loading via
 // the enabled extension. It reports the given extension_dir and ini locations.
 func fakeExistingPHPForExt(version, extDir, loadedFile, scanDir string, simulateLoad bool) string {
+	return fakeExistingPHPForExtArch(version, "x86_64", extDir, loadedFile, scanDir, simulateLoad)
+}
+
+// fakeExistingPHPForExtArch is fakeExistingPHPForExt with an explicit machine
+// architecture reported by php_uname("m") (used to exercise Rosetta-style hosts
+// where the php process arch differs from the host's native arch).
+func fakeExistingPHPForExtArch(version, machine, extDir, loadedFile, scanDir string, simulateLoad bool) string {
 	series := version
 	if i := strings.LastIndex(version, "."); i >= 0 {
 		series = version[:i]
@@ -39,11 +48,11 @@ case "$1" in
   --ini)
     echo "Loaded Configuration File:         \"%s\""
     echo "Scan for additional .ini files in: \"%s\"" ;;
-  -r) printf 'version=%s\nseries=%s\nzts=0\nextension_dir=%s\n' ;;
+  -r) printf 'version=%s\nseries=%s\nzts=0\nmachine=%s\nextension_dir=%s\n' ;;
   *) : ;;
 esac
 exit 0
-`, version, sim, loader, loadedFile, scanDir, version, series, extDir)
+`, version, sim, loader, loadedFile, scanDir, version, series, machine, extDir)
 }
 
 func TestInstallExtensionNoPHP(t *testing.T) {
@@ -192,5 +201,101 @@ func TestInstallExtensionAlreadyPresent(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "nothing to do") {
 		t.Errorf("expected 'nothing to do' message, got: %s", out.String())
+	}
+}
+
+// When the php on PATH is our own interpreter (with the debugger compiled in),
+// installing the extension is a no-op with a message naming the interpreter.
+func TestInstallExtensionSkipsOwnInterpreter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	root := filepath.Join(home, ".local", "share", "php-debugger")
+
+	// Place a fake php that reports the debugger module *under our install root*.
+	ownBin := filepath.Join(root, "8.3", "bin")
+	writeExec(t, filepath.Join(ownBin, "php"), fakePHP("8.3.7", true, "", ""))
+	t.Setenv("PATH", ownBin) // php.Detect() finds our interpreter
+
+	env := linuxUserEnv(home)
+	var out bytes.Buffer
+	// No release client: if the code tried to download, it would fail — proving
+	// we returned before touching the network.
+	err := InstallExtension(context.Background(), Options{Scope: platform.User, Out: &out, Env: &env})
+	if err != nil {
+		t.Fatalf("expected a no-op, got: %v", err)
+	}
+	if !strings.Contains(out.String(), "interpreter") || !strings.Contains(out.String(), "nothing to do") {
+		t.Errorf("expected an interpreter-specific message, got: %s", out.String())
+	}
+	// No extension should be recorded.
+	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
+		t.Error("no manifest should be written when nothing is installed")
+	}
+}
+
+// newFakeExtReleaseServer serves a release whose extension assets exist for both
+// architectures of the given os token, so a test can assert which one is chosen.
+func newFakeExtReleaseServer(t *testing.T, osTok string) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
+			fmt.Fprintf(w, `{"tag_name":"9.9.9","assets":[
+				{"name":"php-debugger-php8.3-nts-%s-x86_64.so","browser_download_url":%q,"size":%d},
+				{"name":"php-debugger-php8.3-nts-%s-arm64.so","browser_download_url":%q,"size":%d}
+			]}`, osTok, srv.URL+"/dl/x86_64", len(fakeSO), osTok, srv.URL+"/dl/arm64", len(fakeSO))
+		case strings.HasPrefix(r.URL.Path, "/dl/"):
+			w.Write([]byte(fakeSO))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// On an Apple-Silicon host running an Intel php under Rosetta, the extension must
+// match the php process's architecture (x86_64), not the host's native arm64.
+func TestInstallExtensionMatchesPHPArch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	extDir := t.TempDir()
+	scanDir := filepath.Join(t.TempDir(), "conf.d")
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	// php reports itself as x86_64 even though the host env below is arm64.
+	writeExec(t, filepath.Join(binDir, "php"),
+		fakeExistingPHPForExtArch("8.3.7", "x86_64", extDir, "", scanDir, true))
+	t.Setenv("PATH", binDir)
+
+	srv := newFakeExtReleaseServer(t, "macos")
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+
+	// Host is Apple Silicon (macos/arm64).
+	env := platform.Env{
+		OS: platform.MacOS, Arch: platform.Arm64, Home: home,
+		Getenv: func(string) string { return "" },
+	}
+
+	var out bytes.Buffer
+	err := InstallExtension(context.Background(), Options{
+		Scope: platform.User, AssumeYes: true, Out: &out, Client: client, Env: &env,
+	})
+	if err != nil {
+		t.Fatalf("InstallExtension: %v\n%s", err, out.String())
+	}
+
+	// The x86_64 extension (matching php) must be chosen, not the host's arm64.
+	if _, err := os.Stat(filepath.Join(extDir, "php-debugger-php8.3-nts-macos-x86_64.so")); err != nil {
+		t.Errorf("expected x86_64 extension to be installed (matching php arch): %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(extDir, "php-debugger-php8.3-nts-macos-arm64.so")); !os.IsNotExist(err) {
+		t.Error("arm64 extension should not have been installed on a Rosetta php")
 	}
 }

@@ -237,6 +237,161 @@ func TestInstallInterpreterReplacesExisting(t *testing.T) {
 	}
 }
 
+// When the new interpreter has the same PHP series and thread-safety as the one
+// it replaces, foreign extensions built for that ABI still load, so their loaders
+// are left intact (only xdebug is stripped).
+func TestInstallInterpreterSameABIKeepsLoaders(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+
+	// New interpreter is 8.3 NTS (see newFakeReleaseServer's asset name).
+	newCfg := filepath.Join(t.TempDir(), "newcfg")
+	newScan := filepath.Join(newCfg, "conf.d")
+	srv := newFakeReleaseServer(t, fakePHP("8.3.12", true, newCfg, newScan))
+
+	// Pre-existing php is the SAME series (8.3) and NTS.
+	existBin := filepath.Join(t.TempDir(), "bin")
+	existIni := t.TempDir()
+	existConfd := filepath.Join(existIni, "conf.d")
+	writeExec(t, filepath.Join(existBin, "php"), existingPHPScript("8.3.4",
+		filepath.Join(existIni, "php.ini"), existConfd, ""))
+	if err := os.WriteFile(filepath.Join(existIni, "php.ini"),
+		[]byte("zend_extension=xdebug.so\nextension=mysqli.so\nmemory_limit=128M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(existConfd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", existBin)
+
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+
+	var out bytes.Buffer
+	err := InstallInterpreter(context.Background(), Options{
+		Scope: platform.User, AssumeYes: true, Out: &out, Client: client, Env: &env,
+	})
+	if err != nil {
+		t.Fatalf("InstallInterpreter: %v\n--- output ---\n%s", err, out.String())
+	}
+
+	mainIni, err := os.ReadFile(filepath.Join(newCfg, "php.ini"))
+	if err != nil {
+		t.Fatalf("main php.ini not copied: %v", err)
+	}
+	s := string(mainIni)
+	// xdebug is always stripped.
+	if strings.Contains(s, "xdebug.so") {
+		t.Errorf("xdebug loader not stripped:\n%s", s)
+	}
+	// The mysqli loader is left active (not commented), because it loads fine.
+	if !strings.Contains(s, "\nextension=mysqli.so") && !strings.HasPrefix(s, "extension=mysqli.so") {
+		t.Errorf("same-ABI: mysqli loader should stay active, not be commented:\n%s", s)
+	}
+	if strings.Contains(s, "; extension=mysqli.so") {
+		t.Errorf("same-ABI: mysqli loader should not be commented:\n%s", s)
+	}
+}
+
+// When our own interpreter for the same version (series + threading) is already
+// active with the debugger, installing again is a no-op.
+func TestInstallInterpreterAlreadyProvided(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	root := filepath.Join(home, ".local", "share", "php-debugger")
+
+	// A fake php that reports the debugger, installed *under our root* (8.3 NTS,
+	// matching what newFakeReleaseServer offers).
+	ownBin := filepath.Join(root, "8.3", "bin")
+	writeExec(t, filepath.Join(ownBin, "php"), fakePHP("8.3.7", true, "", ""))
+	t.Setenv("PATH", ownBin)
+
+	srv := newFakeReleaseServer(t, fakePHP("8.3.7", true, "", ""))
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+
+	var out bytes.Buffer
+	err := InstallInterpreter(context.Background(), Options{
+		Scope: platform.User, Out: &out, Client: client, Env: &env,
+	})
+	if err != nil {
+		t.Fatalf("expected a no-op, got: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "nothing to do") {
+		t.Errorf("expected 'nothing to do' message, got: %s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
+		t.Error("no manifest should be written for a no-op install")
+	}
+}
+
+// When a normal php already loads our standalone extension, installing the
+// interpreter proceeds but the copied config disables that extension loader — the
+// interpreter has the debugger built in, so the .so must not also load. Other
+// same-ABI loaders stay active.
+func TestInstallInterpreterDisablesExistingDebuggerExtension(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+
+	newCfg := filepath.Join(t.TempDir(), "newcfg")
+	newScan := filepath.Join(newCfg, "conf.d")
+	srv := newFakeReleaseServer(t, fakePHP("8.3.12", true, newCfg, newScan))
+
+	// Pre-existing php is the SAME series (8.3 NTS) and its ini loads our
+	// extension plus an unrelated one.
+	existBin := filepath.Join(t.TempDir(), "bin")
+	existIni := t.TempDir()
+	existConfd := filepath.Join(existIni, "conf.d")
+	writeExec(t, filepath.Join(existBin, "php"), existingPHPScript("8.3.4",
+		filepath.Join(existIni, "php.ini"), existConfd, ""))
+	soLoader := "zend_extension=/usr/lib/php/ext/php-debugger-php8.3-nts-linux-x86_64.so"
+	if err := os.WriteFile(filepath.Join(existIni, "php.ini"),
+		[]byte(soLoader+"\nextension=mysqli.so\nmemory_limit=128M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(existConfd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", existBin)
+
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+
+	var out bytes.Buffer
+	err := InstallInterpreter(context.Background(), Options{
+		Scope: platform.User, AssumeYes: true, Out: &out, Client: client, Env: &env,
+	})
+	if err != nil {
+		t.Fatalf("InstallInterpreter: %v\n%s", err, out.String())
+	}
+
+	mainIni, err := os.ReadFile(filepath.Join(newCfg, "php.ini"))
+	if err != nil {
+		t.Fatalf("main php.ini not copied: %v", err)
+	}
+	s := string(mainIni)
+	// The php-debugger extension loader must be stripped entirely.
+	if strings.Contains(s, soLoader) {
+		t.Errorf("debugger extension loader should be removed:\n%s", s)
+	}
+	// Same ABI: the unrelated mysqli loader stays active.
+	if strings.Contains(s, "; extension=mysqli.so") {
+		t.Errorf("same-ABI: mysqli loader should stay active:\n%s", s)
+	}
+	if !strings.Contains(s, "\nextension=mysqli.so") && !strings.HasPrefix(s, "extension=mysqli.so") {
+		t.Errorf("same-ABI: mysqli loader should stay present and active:\n%s", s)
+	}
+}
+
 func TestInstallInterpreterRollbackOnMissingModule(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake php is a /bin/sh script")

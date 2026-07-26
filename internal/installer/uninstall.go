@@ -155,6 +155,15 @@ func uninstallExtension(opts Options, layout platform.Layout, m *manifest.Manife
 			return fmt.Errorf("removing %s: %w", ext.SoPath, err)
 		}
 	}
+	// Restore the ini files we modified in place at install (bringing back any
+	// xdebug we disabled). This runs last so it is authoritative over the loader
+	// removal above for a file that held both.
+	for _, cb := range ext.ConfigBackups {
+		if err := restoreBackup(cb.BackupPath, cb.OriginalPath); err != nil {
+			return fmt.Errorf("restoring %s: %w", cb.OriginalPath, err)
+		}
+		opts.logf("Restored %s.", cb.OriginalPath)
+	}
 	m.ClearExtension()
 	if err := finalizeManifest(layout, m); err != nil {
 		return fmt.Errorf("saving manifest: %w", err)

@@ -45,17 +45,24 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("querying php at %s: %w", path, err)
 	}
-	if existing.ExtensionDir == "" {
-		return fmt.Errorf("php at %s reports no extension_dir; cannot install the extension", path)
-	}
 
-	// Nothing to do if the debugger is already present (e.g. our own
-	// interpreter), unless forced (as by `update`).
+	// Nothing to do if the debugger is already available, unless forced (as by
+	// `update`). This covers two cases: the php on PATH already loads the
+	// extension, or it is our own interpreter with the debugger compiled in
+	// (both report the module via `php -m`).
 	if !opts.Force {
 		if has, _ := php.HasModule(ctx, path, php.DebuggerModule); has {
-			opts.logf("%s already has the %s module; nothing to do.", path, php.DebuggerModule)
+			if isOurInterpreter(path, layout.Root) {
+				opts.logf("php at %s is the php-debugger interpreter, which already includes the debugger built in; nothing to do.", path)
+			} else {
+				opts.logf("php at %s already loads the %s extension; nothing to do.", path, php.DebuggerModule)
+			}
 			return nil
 		}
+	}
+
+	if existing.ExtensionDir == "" {
+		return fmt.Errorf("php at %s reports no extension_dir; cannot install the extension", path)
 	}
 
 	client := opts.Client
@@ -66,19 +73,33 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
+
+	// The extension must match the architecture the existing php runs as, which
+	// can differ from the host (e.g. an Intel php under Rosetta on Apple Silicon).
+	// Fall back to the host arch only if php did not report its machine.
+	arch := p.Arch
+	if existing.Machine != "" {
+		a, err := platform.ArchFromMachine(existing.Machine)
+		if err != nil {
+			return fmt.Errorf("determining architecture of php at %s: %w", path, err)
+		}
+		arch = a
+	}
+	target := platform.Platform{OS: p.OS, Arch: arch}
+
 	asset, err := release.SelectAsset(rel.Assets, release.Selector{
 		Kind:   release.Extension,
 		Series: existing.Series,
 		ZTS:    existing.ZTS,
-		OS:     p.OS,
-		Arch:   p.Arch,
+		OS:     target.OS,
+		Arch:   target.Arch,
 	})
 	if err != nil {
 		return err
 	}
 
 	opts.logf("Installing php-debugger extension for php %s (%s) %s, release %s",
-		existing.Series, threading(existing.ZTS), p, rel.TagName)
+		existing.Series, threading(existing.ZTS), target, rel.TagName)
 
 	tmpDir, err := os.MkdirTemp("", "php-debugger-ext-")
 	if err != nil {
@@ -105,7 +126,10 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	opts.logf("  copied %s", soDst)
 
 	// --- disable any real xdebug in the existing ini files ---
-	if err := stripXdebugFromExisting(existing, rb, opts); err != nil {
+	// Back the originals up (under the install root) so uninstall can restore the
+	// user's xdebug config, since these are their live files, not copies.
+	iniBackups, err := stripXdebugFromExisting(existing, layout.BackupsDir(), rb, opts)
+	if err != nil {
 		rb.run()
 		return fmt.Errorf("updating existing ini files; reverted: %w", err)
 	}
@@ -138,13 +162,14 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	}
 	m.InstallRoot = layout.Root
 	m.SetExtension(manifest.Extension{
-		Series:      existing.Series,
-		PHPVersion:  existing.Version,
-		ZTS:         existing.ZTS,
-		ReleaseTag:  rel.TagName,
-		SoPath:      soDst,
-		IniPath:     iniPath,
-		InstalledAt: opts.clock(),
+		Series:        existing.Series,
+		PHPVersion:    existing.Version,
+		ZTS:           existing.ZTS,
+		ReleaseTag:    rel.TagName,
+		SoPath:        soDst,
+		IniPath:       iniPath,
+		InstalledAt:   opts.clock(),
+		ConfigBackups: iniBackups,
 	})
 	if err := m.Save(layout.ManifestPath()); err != nil {
 		rb.run()
@@ -158,14 +183,15 @@ func InstallExtension(ctx context.Context, opts Options) error {
 // stripXdebugFromExisting disables a real xdebug in the existing php's ini files
 // (in place) so it does not conflict with the debugger's simulated one. It reuses
 // the shared ini rules (see rewriteIniFiles) without commenting other loaders —
-// the existing php can load its own extensions.
-func stripXdebugFromExisting(existing *php.Info, rb *rollback, opts Options) error {
+// the existing php can load its own extensions. Modified files are backed up
+// under backupDir and returned so uninstall can restore the user's xdebug config.
+func stripXdebugFromExisting(existing *php.Info, backupDir string, rb *rollback, opts Options) ([]manifest.FileBackup, error) {
 	var files []string
 	if existing.Ini.LoadedFile != "" {
 		files = append(files, existing.Ini.LoadedFile)
 	}
 	files = append(files, existing.Ini.AdditionalFiles...)
-	return sanitizeInPlace(files, rb, opts)
+	return sanitizeInPlace(files, backupDir, rb, opts)
 }
 
 // enableExtension writes a loader that enables the debugger extension: a

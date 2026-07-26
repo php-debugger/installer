@@ -19,12 +19,21 @@ var AllowedModes = []string{"off", "debug"}
 // rewritten content and the list of removed lines (trimmed of any trailing CR)
 // for reporting.
 func StripXdebugLoaders(content string) (string, []string) {
+	return stripZendLoaders(content, referencesXdebug)
+}
+
+// stripZendLoaders removes every `zend_extension=` directive whose value matches,
+// whether the line is active or commented out, returning the rewritten content
+// and the removed lines (trimmed of any trailing CR) for reporting. Only
+// zend_extension is considered, because both xdebug and the php-debugger
+// extension load solely via it.
+func stripZendLoaders(content string, matches func(value string) bool) (string, []string) {
 	lines := strings.Split(content, "\n")
 	kept := make([]string, 0, len(lines))
 	var removed []string
 	for _, ln := range lines {
 		_, key, value, ok := parseDirective(ln)
-		if ok && key == "zend_extension" && referencesXdebug(value) {
+		if ok && key == "zend_extension" && matches(value) {
 			removed = append(removed, strings.TrimRight(ln, "\r"))
 			continue
 		}
@@ -58,6 +67,21 @@ func CommentExtensionLoaders(content string) (string, []string) {
 		lines[i] = "; " + body + cr
 	}
 	return strings.Join(lines, "\n"), commented
+}
+
+// StripPhpDebuggerLoaders removes every `zend_extension=` directive that loads
+// the php-debugger extension (its value references the php-debugger .so), whether
+// active or commented, returning the rewritten content and the removed lines.
+// Like xdebug, the extension only loads via zend_extension, so `extension=` lines
+// are left alone.
+//
+// It is applied when copying an existing php's config onto the self-contained
+// debugger interpreter, which already has the debugger compiled in: loading the
+// standalone extension on top would register the module twice. Unlike
+// CommentExtensionLoaders this runs regardless of ABI match, because the built-in
+// debugger supersedes the extension in every case.
+func StripPhpDebuggerLoaders(content string) (string, []string) {
+	return stripZendLoaders(content, referencesDebugger)
 }
 
 // DisallowedModes returns the de-duplicated set of xdebug.mode tokens present in
@@ -178,6 +202,14 @@ func rewriteValue(line, newValue string) string {
 
 func referencesXdebug(value string) bool {
 	return strings.Contains(strings.ToLower(unquote(value)), "xdebug")
+}
+
+// referencesDebugger reports whether a loader value points at the php-debugger
+// extension. Its .so is named php-debugger-*, while the module reports as
+// php_debugger; accept either spelling to be safe.
+func referencesDebugger(value string) bool {
+	v := strings.ToLower(unquote(value))
+	return strings.Contains(v, "php-debugger") || strings.Contains(v, "php_debugger")
 }
 
 func parseModeList(value string) []string {

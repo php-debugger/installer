@@ -142,6 +142,13 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	// If our own interpreter for this exact version (series + threading) is
+	// already active with the debugger, there is nothing to do. `update` sets
+	// Force to reinstall against the latest release regardless.
+	if !opts.Force && alreadyProvided(ctx, opts, layout.Root, series) {
+		return nil
+	}
+
 	// Detect a pre-existing interpreter before we change anything. Ignore one
 	// that is our own previous install (avoid backing up our own symlink).
 	existing := detectExisting(ctx, opts, layout.Root)
@@ -299,6 +306,29 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	return nil
 }
 
+// alreadyProvided reports whether the php currently on PATH is our own
+// interpreter for this exact version (series + threading) with the debugger — in
+// which case installing again would be a no-op. It logs an informative message
+// when so. A normal php that merely loads our extension does NOT count: it
+// returns false so the interpreter install proceeds (and disables that
+// extension). Callers gate this on !Force.
+func alreadyProvided(ctx context.Context, opts Options, root, series string) bool {
+	path, err := php.Detect()
+	if err != nil || !isOurInterpreter(path, root) {
+		return false
+	}
+	info, err := php.Query(ctx, path)
+	if err != nil || info.Series != series || info.ZTS != opts.ZTS {
+		return false
+	}
+	if has, _ := php.HasModule(ctx, path, php.DebuggerModule); !has {
+		return false
+	}
+	opts.logf("php %s (%s) with the debugger is already installed and active at %s; nothing to do.",
+		series, threading(opts.ZTS), path)
+	return true
+}
+
 // detectExisting finds a pre-existing php on PATH and queries it. It returns nil
 // if none is found, if it cannot be queried, or if it is our own previous
 // install under root (which must not be treated as a foreign interpreter).
@@ -307,7 +337,7 @@ func detectExisting(ctx context.Context, opts Options, root string) *php.Info {
 	if err != nil {
 		return nil
 	}
-	if resolved, e := filepath.EvalSymlinks(path); e == nil && isUnderRoot(resolved, root) {
+	if isOurInterpreter(path, root) {
 		return nil // our own previously-installed interpreter
 	}
 	info, err := php.Query(ctx, path)
@@ -337,6 +367,21 @@ func chooseLinkDir(existing *php.Info, layout platform.Layout, override string) 
 		return "", false, fmt.Errorf("%w\ntry --user for a per-user install, or re-run with elevated privileges", err)
 	}
 	return binDir, false, nil
+}
+
+// isOurInterpreter reports whether the php at path is one we installed (its real
+// path, after resolving symlinks, lives under our install root). Both sides are
+// canonicalized so symlinked path prefixes (e.g. macOS /var -> /private/var) do
+// not cause a false negative.
+func isOurInterpreter(path, root string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	return isUnderRoot(resolved, root)
 }
 
 func isUnderRoot(path, root string) bool {

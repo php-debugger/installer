@@ -203,6 +203,55 @@ func TestUninstallExtension(t *testing.T) {
 	}
 }
 
+// Installing the extension strips xdebug from the existing php's ini; uninstalling
+// must restore it (the ini is the user's live file, not a copy).
+func TestUninstallExtensionRestoresXdebug(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	extDir := t.TempDir()
+	iniDir := t.TempDir()
+	scanDir := filepath.Join(iniDir, "conf.d")
+	loadedFile := filepath.Join(iniDir, "php.ini")
+	original := "zend_extension=xdebug.so\nxdebug.mode=develop,debug\nmemory_limit=100M\n"
+	if err := os.WriteFile(loadedFile, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(t.TempDir(), "bin")
+	writeExec(t, filepath.Join(binDir, "php"),
+		fakeExistingPHPForExt("8.3.7", extDir, loadedFile, scanDir, true))
+	t.Setenv("PATH", binDir)
+
+	srv := newFakeReleaseServer(t, "unused")
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+
+	if err := InstallExtension(context.Background(), Options{
+		Scope: platform.User, AssumeYes: true, Out: &bytes.Buffer{}, Client: client, Env: &env,
+	}); err != nil {
+		t.Fatalf("install extension: %v", err)
+	}
+	// After install, xdebug is gone and the mode is sanitized.
+	if b, _ := os.ReadFile(loadedFile); strings.Contains(string(b), "xdebug.so") || strings.Contains(string(b), "develop") {
+		t.Fatalf("install should have stripped xdebug:\n%s", b)
+	}
+
+	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
+		false, false, "", false); err != nil {
+		t.Fatalf("uninstall extension: %v", err)
+	}
+	// After uninstall, the ini is byte-for-byte the user's original (xdebug back).
+	got, err := os.ReadFile(loadedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf("ini not restored to original.\n got: %q\nwant: %q", got, original)
+	}
+}
+
 func TestUninstallNothing(t *testing.T) {
 	env := linuxUserEnv(t.TempDir())
 	err := Uninstall(context.Background(), Options{Scope: platform.User, Env: &env},
