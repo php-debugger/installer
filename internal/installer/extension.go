@@ -45,17 +45,24 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("querying php at %s: %w", path, err)
 	}
-	if existing.ExtensionDir == "" {
-		return fmt.Errorf("php at %s reports no extension_dir; cannot install the extension", path)
-	}
 
-	// Nothing to do if the debugger is already present (e.g. our own
-	// interpreter), unless forced (as by `update`).
+	// Nothing to do if the debugger is already available, unless forced (as by
+	// `update`). This covers two cases: the php on PATH already loads the
+	// extension, or it is our own interpreter with the debugger compiled in
+	// (both report the module via `php -m`).
 	if !opts.Force {
 		if has, _ := php.HasModule(ctx, path, php.DebuggerModule); has {
-			opts.logf("%s already has the %s module; nothing to do.", path, php.DebuggerModule)
+			if isOurInterpreter(path, layout.Root) {
+				opts.logf("php at %s is the php-debugger interpreter, which already includes the debugger built in; nothing to do.", path)
+			} else {
+				opts.logf("php at %s already loads the %s extension; nothing to do.", path, php.DebuggerModule)
+			}
 			return nil
 		}
+	}
+
+	if existing.ExtensionDir == "" {
+		return fmt.Errorf("php at %s reports no extension_dir; cannot install the extension", path)
 	}
 
 	client := opts.Client
@@ -66,19 +73,33 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
+
+	// The extension must match the architecture the existing php runs as, which
+	// can differ from the host (e.g. an Intel php under Rosetta on Apple Silicon).
+	// Fall back to the host arch only if php did not report its machine.
+	arch := p.Arch
+	if existing.Machine != "" {
+		a, err := platform.ArchFromMachine(existing.Machine)
+		if err != nil {
+			return fmt.Errorf("determining architecture of php at %s: %w", path, err)
+		}
+		arch = a
+	}
+	target := platform.Platform{OS: p.OS, Arch: arch}
+
 	asset, err := release.SelectAsset(rel.Assets, release.Selector{
 		Kind:   release.Extension,
 		Series: existing.Series,
 		ZTS:    existing.ZTS,
-		OS:     p.OS,
-		Arch:   p.Arch,
+		OS:     target.OS,
+		Arch:   target.Arch,
 	})
 	if err != nil {
 		return err
 	}
 
 	opts.logf("Installing php-debugger extension for php %s (%s) %s, release %s",
-		existing.Series, threading(existing.ZTS), p, rel.TagName)
+		existing.Series, threading(existing.ZTS), target, rel.TagName)
 
 	tmpDir, err := os.MkdirTemp("", "php-debugger-ext-")
 	if err != nil {
@@ -95,17 +116,30 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	rb := &rollback{}
 
 	// --- copy the extension into extension_dir ---
-	soDst := filepath.Join(existing.ExtensionDir, asset.Name)
+	// Resolve a relative extension_dir to an absolute path. PHP may report one
+	// (notably Windows configs default to "ext"), which it resolves against the PHP
+	// installation directory — not the installer's working directory. Installing to
+	// the raw relative value would drop the .so under the current directory and
+	// record a CWD-relative loader path that only loads when php runs from here.
+	extDir := resolveExtensionDir(existing.ExtensionDir, path)
+	if extDir != existing.ExtensionDir {
+		opts.logf("Note: php reports a relative extension_dir (%q); installing into %s.",
+			existing.ExtensionDir, extDir)
+	}
+	soDst := filepath.Join(extDir, asset.Name)
 	if err := registerFileRestore(soDst, rb, 0o755); err != nil {
 		return err
 	}
 	if err := installFile(dlPath, soDst); err != nil {
-		return fmt.Errorf("installing extension into %s: %w", existing.ExtensionDir, err)
+		return fmt.Errorf("installing extension into %s: %w", extDir, err)
 	}
 	opts.logf("  copied %s", soDst)
 
 	// --- disable any real xdebug in the existing ini files ---
-	if err := stripXdebugFromExisting(existing, rb, opts); err != nil {
+	// Back the originals up (under the install root) so uninstall can restore the
+	// user's xdebug config, since these are their live files, not copies.
+	iniBackups, err := stripXdebugFromExisting(existing, layout.BackupsDir(), rb, opts)
+	if err != nil {
 		rb.run()
 		return fmt.Errorf("updating existing ini files; reverted: %w", err)
 	}
@@ -137,14 +171,22 @@ func InstallExtension(ctx context.Context, opts Options) error {
 		return err
 	}
 	m.InstallRoot = layout.Root
+	// Preserve the user's original ini backups across reinstalls/updates. A re-run
+	// (e.g. `update`, which forces past the already-installed guard) typically finds
+	// xdebug already stripped, so stripXdebugFromExisting produces no new backups;
+	// the prior extension record still holds the true pre-strip originals, so carry
+	// those forward for any file we did not freshly back up this run — otherwise
+	// uninstall could no longer restore the user's xdebug configuration.
+	iniBackups = preserveBackups(m.Extension, iniBackups)
 	m.SetExtension(manifest.Extension{
-		Series:      existing.Series,
-		PHPVersion:  existing.Version,
-		ZTS:         existing.ZTS,
-		ReleaseTag:  rel.TagName,
-		SoPath:      soDst,
-		IniPath:     iniPath,
-		InstalledAt: opts.clock(),
+		Series:        existing.Series,
+		PHPVersion:    existing.Version,
+		ZTS:           existing.ZTS,
+		ReleaseTag:    rel.TagName,
+		SoPath:        soDst,
+		IniPath:       iniPath,
+		InstalledAt:   opts.clock(),
+		ConfigBackups: iniBackups,
 	})
 	if err := m.Save(layout.ManifestPath()); err != nil {
 		rb.run()
@@ -158,14 +200,56 @@ func InstallExtension(ctx context.Context, opts Options) error {
 // stripXdebugFromExisting disables a real xdebug in the existing php's ini files
 // (in place) so it does not conflict with the debugger's simulated one. It reuses
 // the shared ini rules (see rewriteIniFiles) without commenting other loaders —
-// the existing php can load its own extensions.
-func stripXdebugFromExisting(existing *php.Info, rb *rollback, opts Options) error {
+// the existing php can load its own extensions. Modified files are backed up
+// under backupDir and returned so uninstall can restore the user's xdebug config.
+func stripXdebugFromExisting(existing *php.Info, backupDir string, rb *rollback, opts Options) ([]manifest.FileBackup, error) {
 	var files []string
 	if existing.Ini.LoadedFile != "" {
 		files = append(files, existing.Ini.LoadedFile)
 	}
 	files = append(files, existing.Ini.AdditionalFiles...)
-	return sanitizeInPlace(files, rb, opts)
+	return sanitizeInPlace(files, backupDir, rb, opts)
+}
+
+// preserveBackups merges the ini backups created this run (fresh) with those from
+// a prior extension record (if any). A freshly-captured backup wins for its own
+// file — it holds that file's pre-strip contents from this run. For files not
+// touched this run (the common update case, where xdebug was already stripped at
+// first install), the prior backup is kept, since it holds the user's true
+// original contents. Returns fresh unchanged when there is nothing to preserve.
+func preserveBackups(prior *manifest.Extension, fresh []manifest.FileBackup) []manifest.FileBackup {
+	if prior == nil || len(prior.ConfigBackups) == 0 {
+		return fresh
+	}
+	freshByPath := make(map[string]bool, len(fresh))
+	for _, b := range fresh {
+		freshByPath[b.OriginalPath] = true
+	}
+	merged := append([]manifest.FileBackup(nil), fresh...)
+	for _, b := range prior.ConfigBackups {
+		if !freshByPath[b.OriginalPath] {
+			merged = append(merged, b)
+		}
+	}
+	return merged
+}
+
+// resolveExtensionDir returns an absolute extension directory. PHP sometimes
+// reports a relative extension_dir (notably Windows' default "ext"), which it
+// resolves against the PHP installation directory rather than the current working
+// directory. We mirror that by resolving it against the php binary's directory
+// (following symlinks to the real install location), so the .so is installed
+// alongside PHP's other extensions and the loader references it by an absolute
+// path. An already-absolute dir is returned unchanged.
+func resolveExtensionDir(extDir, phpPath string) string {
+	if filepath.IsAbs(extDir) {
+		return extDir
+	}
+	base := filepath.Dir(phpPath)
+	if resolved, err := filepath.EvalSymlinks(phpPath); err == nil {
+		base = filepath.Dir(resolved)
+	}
+	return filepath.Join(base, extDir)
 }
 
 // enableExtension writes a loader that enables the debugger extension: a

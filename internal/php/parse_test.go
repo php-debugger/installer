@@ -6,12 +6,13 @@ import (
 )
 
 func TestParseKeyVals(t *testing.T) {
-	out := "version=8.3.10\nseries=8.3\nzts=0\nextension_dir=/usr/lib/php/20230831\n"
+	out := "version=8.3.10\nseries=8.3\nzts=0\nmachine=x86_64\nextension_dir=/usr/lib/php/20230831\n"
 	kv := parseKeyVals(out)
 	want := map[string]string{
 		"version":       "8.3.10",
 		"series":        "8.3",
 		"zts":           "0",
+		"machine":       "x86_64",
 		"extension_dir": "/usr/lib/php/20230831",
 	}
 	if !reflect.DeepEqual(kv, want) {

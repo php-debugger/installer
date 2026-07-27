@@ -1,10 +1,27 @@
 package platform
 
 import (
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
 )
+
+// ArchFromMachine maps a `uname -m`-style machine name — as reported by
+// php_uname("m") — to a release architecture token. This is the architecture the
+// PHP *process* runs as, which is what its matching extension must be built for:
+// an Intel php running under Rosetta 2 on Apple Silicon reports "x86_64", so it
+// needs the x86_64 extension, not the host's native arm64 one.
+func ArchFromMachine(machine string) (Arch, error) {
+	switch strings.ToLower(strings.TrimSpace(machine)) {
+	case "x86_64", "amd64", "x64":
+		return X8664, nil
+	case "arm64", "aarch64":
+		return Arm64, nil
+	default:
+		return "", fmt.Errorf("unrecognized machine architecture %q", machine)
+	}
+}
 
 // detectNativeArch upgrades a detected architecture to the host's *native*
 // architecture when they differ due to emulation. Concretely: an x86_64 build of

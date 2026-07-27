@@ -98,6 +98,49 @@ func TestUpdateInterpreter(t *testing.T) {
 	}
 }
 
+// Regression: when the installer's own interpreter is active and on PATH, update
+// must still reinstall against a newer release. The "already provided" check in
+// InstallInterpreter matches on series+threading (not release tag), so update has
+// to force past it — otherwise it silently no-ops and leaves the old binary/tag.
+func TestUpdateInterpreterActiveOnPATH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	// Put the install's bin dir on PATH so the active php is discoverable, the way
+	// it is after a real install (unlike the isolated-PATH tests above).
+	binDir := filepath.Join(home, ".local", "bin")
+	t.Setenv("PATH", binDir)
+
+	ms := newMutableServer(t, "1.0.0", fakePHP("8.3.7", true, "", ""))
+	opts, manifestPath := installBaseInterpreter(t, home, ms)
+
+	// Sanity: the active php is now on PATH and reports the debugger.
+	if has, err := phpHasDebugger(filepath.Join(binDir, "php")); err != nil || !has {
+		t.Fatalf("active php not usable on PATH: has=%v err=%v", has, err)
+	}
+
+	// A newer release appears.
+	ms.set("2.0.0", fakePHP("8.3.9", true, "", ""))
+
+	var out bytes.Buffer
+	uo := opts
+	uo.Out = &out
+	uo.PHPVersion = ""
+	if err := Update(context.Background(), uo, false, false); err != nil {
+		t.Fatalf("Update: %v\n%s", err, out.String())
+	}
+
+	m, _ := manifest.Load(manifestPath)
+	it, _ := m.Interpreter("8.3")
+	if it.ReleaseTag != "2.0.0" {
+		t.Errorf("ReleaseTag = %q, want 2.0.0 (update no-opped past the already-provided check)", it.ReleaseTag)
+	}
+	if it.PHPVersion != "8.3.9" {
+		t.Errorf("PHPVersion = %q, want 8.3.9", it.PHPVersion)
+	}
+}
+
 func TestUpdateAlreadyLatest(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake php is a /bin/sh script")

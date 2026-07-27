@@ -64,3 +64,26 @@ func TestDetectNativeArch(t *testing.T) {
 		})
 	}
 }
+
+func TestArchFromMachine(t *testing.T) {
+	ok := map[string]Arch{
+		"x86_64":  X8664,
+		"amd64":   X8664,
+		"x64":     X8664,
+		"X86_64":  X8664,
+		" x86_64": X8664,
+		"arm64":   Arm64,
+		"aarch64": Arm64,
+		"ARM64":   Arm64,
+	}
+	for in, want := range ok {
+		if got, err := ArchFromMachine(in); err != nil || got != want {
+			t.Errorf("ArchFromMachine(%q) = %s, %v; want %s", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "i386", "ppc64", "riscv64"} {
+		if _, err := ArchFromMachine(in); err == nil {
+			t.Errorf("ArchFromMachine(%q) should error", in)
+		}
+	}
+}

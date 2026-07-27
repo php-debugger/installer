@@ -36,14 +36,18 @@ type Info struct {
 	Version      string // full version, e.g. "8.3.10"
 	Series       string // major.minor, e.g. "8.3"
 	ZTS          bool   // thread-safe build
+	Machine      string // php_uname("m"): the arch the php process runs as
 	ExtensionDir string // ini_get("extension_dir")
 	Ini          IniPaths
 }
 
 // infoScript prints the interpreter facts as key=value lines. Using -r keeps the
-// output locale-independent (unlike parsing -v / -i prose).
-const infoScript = `printf("version=%s\nseries=%s\nzts=%d\nextension_dir=%s\n",` +
-	` PHP_VERSION, PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION, PHP_ZTS, ini_get("extension_dir"));`
+// output locale-independent (unlike parsing -v / -i prose). Machine comes from
+// php_uname("m") — the architecture the php *process* runs as (e.g. "x86_64" for
+// an Intel php running under Rosetta on Apple Silicon), which is what a matching
+// extension must be built for.
+const infoScript = `printf("version=%s\nseries=%s\nzts=%d\nmachine=%s\nextension_dir=%s\n",` +
+	` PHP_VERSION, PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION, PHP_ZTS, php_uname("m"), ini_get("extension_dir"));`
 
 // Detect returns the path to the php interpreter on PATH, or ErrNotFound.
 func Detect() (string, error) {
@@ -96,6 +100,7 @@ func Query(ctx context.Context, binary string) (*Info, error) {
 	info.Version = kv["version"]
 	info.Series = kv["series"]
 	info.ZTS = kv["zts"] == "1"
+	info.Machine = kv["machine"]
 	info.ExtensionDir = kv["extension_dir"]
 
 	iniOut, err := run(ctx, binary, "--ini")

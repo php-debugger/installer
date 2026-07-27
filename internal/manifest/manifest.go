@@ -64,6 +64,17 @@ type Extension struct {
 	SoPath      string    `json:"soPath"`  // installed .so/.dll path
 	IniPath     string    `json:"iniPath"` // ini file holding the loader line
 	InstalledAt time.Time `json:"installedAt"`
+	// ConfigBackups are existing ini files this install modified in place (e.g. to
+	// remove xdebug), backed up so uninstall can restore them to their original
+	// contents.
+	ConfigBackups []FileBackup `json:"configBackups,omitempty"`
+}
+
+// FileBackup records a file that was modified in place, so its original contents
+// can be restored on uninstall.
+type FileBackup struct {
+	OriginalPath string `json:"originalPath"` // the file that was modified
+	BackupPath   string `json:"backupPath"`   // where its original contents were saved
 }
 
 // New returns an empty manifest for the given install root and bin directory.
