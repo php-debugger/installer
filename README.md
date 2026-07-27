@@ -21,10 +21,10 @@ Windows (PowerShell):
 powershell -c "irm https://github.com/php-debugger/installer/releases/latest/download/install.ps1 | iex"
 ```
 
-The script detects your OS/arch, downloads the right archive, and installs the
-binary (into the current directory by default; set `INSTALL_DIR` to change it, or
-`VERSION` to pin a release). Because it fetches with `curl`/`wget` rather than a
-browser, the binary is **not quarantined**, so macOS Gatekeeper doesn't block it.
+The script detects your OS/arch, downloads the latest archive, and installs the
+binary (into the current directory by default; set `INSTALL_DIR` to change it).
+Because it fetches with `curl`/`wget` rather than a browser, the binary is **not
+quarantined**, so macOS Gatekeeper doesn't block it.
 
 ### Download a prebuilt binary
 

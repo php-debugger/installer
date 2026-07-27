@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/php-debugger/installer/internal/manifest"
@@ -232,6 +233,238 @@ func TestInstallExtensionSkipsOwnInterpreter(t *testing.T) {
 	// No extension should be recorded.
 	if _, err := os.Stat(filepath.Join(root, "manifest.json")); !os.IsNotExist(err) {
 		t.Error("no manifest should be written when nothing is installed")
+	}
+}
+
+// mutableExtServer serves a release with a single extension asset whose tag can
+// change between requests, to simulate a newer release becoming available.
+type mutableExtServer struct {
+	mu  sync.Mutex
+	tag string
+	URL string
+}
+
+func newMutableExtServer(t *testing.T, tag string) *mutableExtServer {
+	t.Helper()
+	ms := &mutableExtServer{tag: tag}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ms.mu.Lock()
+		tag := ms.tag
+		ms.mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
+			fmt.Fprintf(w, `{"tag_name":%q,"assets":[
+				{"name":"php-debugger-php8.3-nts-linux-x86_64.so","browser_download_url":%q,"size":%d}
+			]}`, tag, ms.URL+"/dl/ext", len(fakeSO))
+		case r.URL.Path == "/dl/ext":
+			w.Write([]byte(fakeSO))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	ms.URL = srv.URL
+	t.Cleanup(srv.Close)
+	return ms
+}
+
+func (ms *mutableExtServer) set(tag string) {
+	ms.mu.Lock()
+	ms.tag = tag
+	ms.mu.Unlock()
+}
+
+// Regression: updating the extension must not lose the original ini backups. The
+// update re-runs InstallExtension (forced), which finds xdebug already stripped
+// and so produces no new backups; the manifest must retain the first install's
+// backups so a later uninstall can still restore the user's xdebug config.
+func TestUpdateExtensionPreservesXdebugBackup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	extDir := t.TempDir()
+	iniDir := t.TempDir()
+	scanDir := filepath.Join(iniDir, "conf.d")
+	loadedFile := filepath.Join(iniDir, "php.ini")
+	original := "zend_extension=xdebug.so\nxdebug.mode=develop,debug\nmemory_limit=100M\n"
+	if err := os.WriteFile(loadedFile, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(t.TempDir(), "bin")
+	writeExec(t, filepath.Join(binDir, "php"),
+		fakeExistingPHPForExt("8.3.7", extDir, loadedFile, scanDir, true))
+	t.Setenv("PATH", binDir)
+
+	ms := newMutableExtServer(t, "1.0.0")
+	client := release.NewClient()
+	client.BaseURL = ms.URL
+	env := linuxUserEnv(home)
+	opts := Options{Scope: platform.User, AssumeYes: true, Out: &bytes.Buffer{}, Client: client, Env: &env}
+
+	if err := InstallExtension(context.Background(), opts); err != nil {
+		t.Fatalf("install extension: %v", err)
+	}
+	manifestPath := filepath.Join(home, ".local", "share", "php-debugger", "manifest.json")
+	m, _ := manifest.Load(manifestPath)
+	if m.Extension == nil || len(m.Extension.ConfigBackups) == 0 {
+		t.Fatalf("first install should record ini backups, got %+v", m.Extension)
+	}
+
+	// A newer release appears; update the extension.
+	ms.set("2.0.0")
+	var out bytes.Buffer
+	uo := opts
+	uo.Out = &out
+	if err := Update(context.Background(), uo, false, true); err != nil {
+		t.Fatalf("Update: %v\n%s", err, out.String())
+	}
+
+	// The backups must survive the update (bug: they were nil'd out).
+	m, _ = manifest.Load(manifestPath)
+	if m.Extension == nil || m.Extension.ReleaseTag != "2.0.0" {
+		t.Fatalf("extension not updated: %+v", m.Extension)
+	}
+	if len(m.Extension.ConfigBackups) == 0 {
+		t.Fatal("update lost the ini backups; uninstall could no longer restore xdebug")
+	}
+
+	// End-to-end: uninstall after update must restore the user's original ini.
+	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
+		false, false, "", false); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	got, err := os.ReadFile(loadedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf("ini not restored after update+uninstall.\n got: %q\nwant: %q", got, original)
+	}
+}
+
+// Regression: a php that reports a relative extension_dir (e.g. Windows' "ext")
+// must have the .so installed under the PHP install dir, with an absolute loader
+// path — not relative to the installer's working directory.
+func TestInstallExtensionResolvesRelativeExtensionDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	t.Chdir(t.TempDir()) // contain (and make detectable) any CWD-relative write
+	home := t.TempDir()
+	scanDir := filepath.Join(t.TempDir(), "conf.d")
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	// php reports a RELATIVE extension_dir ("ext").
+	writeExec(t, filepath.Join(binDir, "php"),
+		fakeExistingPHPForExtArch("8.3.7", "x86_64", "ext", "", scanDir, true))
+	t.Setenv("PATH", binDir)
+
+	srv := newFakeReleaseServer(t, "unused")
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+
+	var out bytes.Buffer
+	if err := InstallExtension(context.Background(), Options{
+		Scope: platform.User, AssumeYes: true, Out: &out, Client: client, Env: &env,
+	}); err != nil {
+		t.Fatalf("InstallExtension: %v\n%s", err, out.String())
+	}
+
+	// The .so lands under the php install dir's ext/, addressed absolutely.
+	phpReal, err := filepath.EvalSymlinks(filepath.Join(binDir, "php"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSo := filepath.Join(filepath.Dir(phpReal), "ext", "php-debugger-php8.3-nts-linux-x86_64.so")
+	if _, err := os.Stat(wantSo); err != nil {
+		t.Errorf("extension not installed at resolved absolute path %s: %v", wantSo, err)
+	}
+	// Nothing should have been written relative to the working directory.
+	if _, err := os.Stat("ext"); err == nil {
+		t.Error("extension dir was created relative to CWD")
+	}
+	// The loader references the .so by that absolute path.
+	loader := filepath.Join(scanDir, "99-php-debugger.ini")
+	if lb, _ := os.ReadFile(loader); !strings.Contains(string(lb), "zend_extension="+wantSo) {
+		t.Errorf("loader should reference absolute .so path %s:\n%s", wantSo, lb)
+	}
+	// The manifest records the absolute .so path (so uninstall removes the right file).
+	m, _ := manifest.Load(filepath.Join(home, ".local", "share", "php-debugger", "manifest.json"))
+	if m.Extension == nil || m.Extension.SoPath != wantSo {
+		t.Errorf("manifest SoPath = %+v, want %s", m.Extension, wantSo)
+	}
+}
+
+// Regression: a forced extension reinstall that creates a fresh ini backup and
+// then rolls back (verification fails) must NOT delete the prior run's backup,
+// which the persisted manifest still references. Unique backup paths guarantee the
+// fresh backup can't collide with the old one.
+func TestForcedReinstallRollbackKeepsPriorIniBackup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	extDir := t.TempDir()
+	iniDir := t.TempDir()
+	scanDir := filepath.Join(iniDir, "conf.d")
+	loadedFile := filepath.Join(iniDir, "php.ini")
+	original := "zend_extension=xdebug.so\nxdebug.mode=develop,debug\nmemory_limit=100M\n"
+	if err := os.WriteFile(loadedFile, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	phpPath := filepath.Join(t.TempDir(), "bin", "php")
+	writeExec(t, phpPath, fakeExistingPHPForExt("8.3.7", extDir, loadedFile, scanDir, true))
+	t.Setenv("PATH", filepath.Dir(phpPath))
+
+	srv := newFakeReleaseServer(t, "unused")
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+	opts := Options{Scope: platform.User, AssumeYes: true, Out: &bytes.Buffer{}, Client: client, Env: &env}
+
+	// First install: strips xdebug and records backup B1 holding the original.
+	if err := InstallExtension(context.Background(), opts); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	manifestPath := filepath.Join(home, ".local", "share", "php-debugger", "manifest.json")
+	m, _ := manifest.Load(manifestPath)
+	if m.Extension == nil || len(m.Extension.ConfigBackups) == 0 {
+		t.Fatalf("expected a config backup, got %+v", m.Extension)
+	}
+	b1 := m.Extension.ConfigBackups[0].BackupPath
+	if data, err := os.ReadFile(b1); err != nil || !strings.Contains(string(data), "xdebug.so") {
+		t.Fatalf("B1 should hold the original xdebug ini: %q err=%v", data, err)
+	}
+
+	// The user re-adds xdebug (so a forced reinstall strips again → a fresh backup),
+	// and the reinstall is made to FAIL at verification so it rolls back.
+	if err := os.WriteFile(loadedFile, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeExec(t, phpPath, fakeExistingPHPForExt("8.3.7", extDir, loadedFile, scanDir, false))
+
+	fo := opts
+	fo.Force = true
+	if err := InstallExtension(context.Background(), fo); err == nil {
+		t.Fatal("expected forced reinstall to fail at verification (so it rolls back)")
+	}
+
+	// The prior backup B1 must survive the rollback (unique paths ⇒ no collision).
+	if _, err := os.Stat(b1); err != nil {
+		t.Errorf("prior backup B1 was deleted by the rollback: %v", err)
+	}
+	// The persisted (unchanged) manifest still references B1 and can restore xdebug.
+	m2, _ := manifest.Load(manifestPath)
+	if m2.Extension == nil || len(m2.Extension.ConfigBackups) == 0 ||
+		m2.Extension.ConfigBackups[0].BackupPath != b1 {
+		t.Fatalf("manifest should still reference B1: %+v", m2.Extension)
+	}
+	if err := restoreBackup(b1, loadedFile); err != nil {
+		t.Fatalf("restore from B1 failed: %v", err)
+	}
+	if got, _ := os.ReadFile(loadedFile); string(got) != original {
+		t.Errorf("restore did not reproduce the original ini:\n%s", got)
 	}
 }
 

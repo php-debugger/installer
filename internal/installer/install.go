@@ -225,20 +225,38 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	}
 
 	// --- back up and replace an existing interpreter at its location ---
-	var backup *manifest.Backup
+	var backups []manifest.Backup
 	if replaceExisting {
 		opts.logf("Backing up existing interpreter at %s ...", existing.Path)
 		backupPath, err := backupExisting(existing.Path, layout.BackupsDir(),
-			platform.VersionDirName(series, opts.ZTS), time.Now().UnixNano())
+			platform.VersionDirName(series, opts.ZTS))
 		if err != nil {
 			rb.run()
 			return fmt.Errorf("backing up existing interpreter; rolled back: %w", err)
 		}
 		origPath := existing.Path
 		rb.add(func() error { return restoreBackup(backupPath, origPath) })
-		backup = &manifest.Backup{OriginalPath: origPath, BackupPath: backupPath, CreatedAt: opts.clock()}
+		backups = append(backups, manifest.Backup{OriginalPath: origPath, BackupPath: backupPath, CreatedAt: opts.clock()})
 		maybeWarnManaged(opts, existing)
 	}
+
+	// --- preserve any un-backed-up file at the activation path(s) ---
+	// Activate replaces whatever occupies the active `php` path, and on Windows it
+	// materializes one of php.exe / php.cmd and removes the other. Back up anything
+	// there we have not already preserved, so activation cannot destroy it
+	// irrecoverably — a foreign php off PATH, one whose query failed (clean-host
+	// fallback), a real sibling next to a replaced interpreter (a php.cmd beside the
+	// detected php.exe), or a user-created symlink pointing at some other php. This
+	// runs even after replacing a detected interpreter: that file is already moved
+	// aside, so it is skipped here. Only a symlink that is our own active entry
+	// (resolves into our install root) is skipped — everything else is preserved.
+	bs, err := preserveDestination(activeCandidatePaths(p.OS, linkDir), layout.BackupsDir(),
+		platform.VersionDirName(series, opts.ZTS), layout.Root, rb, opts)
+	if err != nil {
+		rb.run()
+		return fmt.Errorf("backing up interpreter at the activation path; rolled back: %w", err)
+	}
+	backups = append(backups, bs...)
 
 	// --- activate (symlink into the chosen bin dir) ---
 	prevTarget, _, hadPrev := platform.ReadActive(linkDir, "php")
@@ -291,8 +309,8 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		ConfigFiles: configFiles,
 	})
 	m.SetActive(key)
-	if backup != nil {
-		m.SetBackup(key, *backup)
+	for i, b := range backups {
+		m.SetBackup(backupKey(key, i), b)
 	}
 	if err := m.Save(layout.ManifestPath()); err != nil {
 		rb.run()
@@ -405,6 +423,75 @@ func maybeWarnManaged(opts Options, existing *php.Info) {
 func isDir(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
+}
+
+// shouldPreserve reports whether the file at an activation candidate path must be
+// backed up before activation overwrites it. A regular file always is (a foreign
+// interpreter or shim). A symlink is preserved too — unless it is our own active
+// entry, proven by resolving into our install root — because a user-created symlink
+// to another php would otherwise be replaced with no way to restore it on
+// uninstall. Missing paths and other node types (dirs, sockets) are left alone.
+func shouldPreserve(path, root string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if fi.Mode().IsRegular() {
+		return true
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return !isOurInterpreter(path, root)
+	}
+	return false
+}
+
+// activeCandidatePaths lists the paths where activation may materialize the active
+// `php`, so the installer can preserve any real file it is about to replace. On
+// Windows activation writes either a php.exe symlink or a php.cmd shim (removing
+// the other), so both are candidates; elsewhere it is just php. It mirrors
+// platform.Activate's naming but keys off the target OS (not runtime.GOOS) so the
+// backup decision is made for the platform being installed to.
+func activeCandidatePaths(osID platform.OS, binDir string) []string {
+	if osID == platform.Windows {
+		return []string{
+			filepath.Join(binDir, "php.exe"),
+			filepath.Join(binDir, "php.cmd"),
+		}
+	}
+	return []string{filepath.Join(binDir, "php")}
+}
+
+// preserveDestination backs up every candidate file that must not be lost to
+// activation (see shouldPreserve), registering a rollback restore for each and
+// returning the recorded backups. On Windows both php.exe and php.cmd can exist and
+// activation clobbers/removes both forms, so both are preserved — not just the first
+// found. root identifies our install so our own active symlink is not backed up.
+func preserveDestination(candidates []string, backupDir, key, root string, rb *rollback, opts Options) ([]manifest.Backup, error) {
+	var backups []manifest.Backup
+	for _, p := range candidates {
+		if !shouldPreserve(p, root) {
+			continue
+		}
+		opts.logf("Backing up existing interpreter at %s ...", p)
+		backupPath, err := backupExisting(p, backupDir, key)
+		if err != nil {
+			return backups, err
+		}
+		orig := p
+		rb.add(func() error { return restoreBackup(backupPath, orig) })
+		backups = append(backups, manifest.Backup{OriginalPath: orig, BackupPath: backupPath, CreatedAt: opts.clock()})
+	}
+	return backups, nil
+}
+
+// backupKey names a manifest backup entry. The first keeps the bare version key
+// (the common single-backup case); extras get a suffix so multiple displaced files
+// sharing one active slot (e.g. a Windows php.exe and php.cmd) coexist in the map.
+func backupKey(versionKey string, index int) string {
+	if index == 0 {
+		return versionKey
+	}
+	return fmt.Sprintf("%s#%d", versionKey, index)
 }
 
 func threading(zts bool) string {

@@ -116,12 +116,22 @@ func InstallExtension(ctx context.Context, opts Options) error {
 	rb := &rollback{}
 
 	// --- copy the extension into extension_dir ---
-	soDst := filepath.Join(existing.ExtensionDir, asset.Name)
+	// Resolve a relative extension_dir to an absolute path. PHP may report one
+	// (notably Windows configs default to "ext"), which it resolves against the PHP
+	// installation directory — not the installer's working directory. Installing to
+	// the raw relative value would drop the .so under the current directory and
+	// record a CWD-relative loader path that only loads when php runs from here.
+	extDir := resolveExtensionDir(existing.ExtensionDir, path)
+	if extDir != existing.ExtensionDir {
+		opts.logf("Note: php reports a relative extension_dir (%q); installing into %s.",
+			existing.ExtensionDir, extDir)
+	}
+	soDst := filepath.Join(extDir, asset.Name)
 	if err := registerFileRestore(soDst, rb, 0o755); err != nil {
 		return err
 	}
 	if err := installFile(dlPath, soDst); err != nil {
-		return fmt.Errorf("installing extension into %s: %w", existing.ExtensionDir, err)
+		return fmt.Errorf("installing extension into %s: %w", extDir, err)
 	}
 	opts.logf("  copied %s", soDst)
 
@@ -161,6 +171,13 @@ func InstallExtension(ctx context.Context, opts Options) error {
 		return err
 	}
 	m.InstallRoot = layout.Root
+	// Preserve the user's original ini backups across reinstalls/updates. A re-run
+	// (e.g. `update`, which forces past the already-installed guard) typically finds
+	// xdebug already stripped, so stripXdebugFromExisting produces no new backups;
+	// the prior extension record still holds the true pre-strip originals, so carry
+	// those forward for any file we did not freshly back up this run — otherwise
+	// uninstall could no longer restore the user's xdebug configuration.
+	iniBackups = preserveBackups(m.Extension, iniBackups)
 	m.SetExtension(manifest.Extension{
 		Series:        existing.Series,
 		PHPVersion:    existing.Version,
@@ -192,6 +209,47 @@ func stripXdebugFromExisting(existing *php.Info, backupDir string, rb *rollback,
 	}
 	files = append(files, existing.Ini.AdditionalFiles...)
 	return sanitizeInPlace(files, backupDir, rb, opts)
+}
+
+// preserveBackups merges the ini backups created this run (fresh) with those from
+// a prior extension record (if any). A freshly-captured backup wins for its own
+// file — it holds that file's pre-strip contents from this run. For files not
+// touched this run (the common update case, where xdebug was already stripped at
+// first install), the prior backup is kept, since it holds the user's true
+// original contents. Returns fresh unchanged when there is nothing to preserve.
+func preserveBackups(prior *manifest.Extension, fresh []manifest.FileBackup) []manifest.FileBackup {
+	if prior == nil || len(prior.ConfigBackups) == 0 {
+		return fresh
+	}
+	freshByPath := make(map[string]bool, len(fresh))
+	for _, b := range fresh {
+		freshByPath[b.OriginalPath] = true
+	}
+	merged := append([]manifest.FileBackup(nil), fresh...)
+	for _, b := range prior.ConfigBackups {
+		if !freshByPath[b.OriginalPath] {
+			merged = append(merged, b)
+		}
+	}
+	return merged
+}
+
+// resolveExtensionDir returns an absolute extension directory. PHP sometimes
+// reports a relative extension_dir (notably Windows' default "ext"), which it
+// resolves against the PHP installation directory rather than the current working
+// directory. We mirror that by resolving it against the php binary's directory
+// (following symlinks to the real install location), so the .so is installed
+// alongside PHP's other extensions and the loader references it by an absolute
+// path. An already-absolute dir is returned unchanged.
+func resolveExtensionDir(extDir, phpPath string) string {
+	if filepath.IsAbs(extDir) {
+		return extDir
+	}
+	base := filepath.Dir(phpPath)
+	if resolved, err := filepath.EvalSymlinks(phpPath); err == nil {
+		base = filepath.Dir(resolved)
+	}
+	return filepath.Join(base, extDir)
 }
 
 // enableExtension writes a loader that enables the debugger extension: a

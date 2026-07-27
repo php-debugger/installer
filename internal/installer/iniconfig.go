@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/php-debugger/installer/internal/ini"
@@ -75,7 +74,7 @@ func rewriteIniFiles(pairs []configPair, cfg iniRewriteOptions, rb *rollback, op
 
 		// Persist the original contents (for uninstall) before overwriting.
 		if cfg.backupDir != "" {
-			bpath, err := saveIniBackup(cfg.backupDir, pr.dst, data, len(backups))
+			bpath, err := saveIniBackup(cfg.backupDir, pr.dst, data)
 			if err != nil {
 				return written, backups, err
 			}
@@ -99,16 +98,30 @@ func rewriteIniFiles(pairs []configPair, cfg iniRewriteOptions, rb *rollback, op
 }
 
 // saveIniBackup writes the original contents of originalPath into backupDir under
-// a unique, traceable name, returning the backup path.
-func saveIniBackup(backupDir, originalPath string, data []byte, index int) (string, error) {
+// a unique, traceable name, returning the backup path. The name is made unique
+// (via CreateTemp) rather than deterministic so a fresh backup never collides with
+// one from a previous run: otherwise a forced reinstall could overwrite — and its
+// rollback delete — a backup file the persisted manifest still points at, breaking
+// a later uninstall restore.
+func saveIniBackup(backupDir, originalPath string, data []byte) (string, error) {
 	if err := os.MkdirAll(backupDir, 0o755); err != nil {
 		return "", fmt.Errorf("creating backup dir: %w", err)
 	}
-	bpath := filepath.Join(backupDir, "ini-"+strconv.Itoa(index)+"-"+filepath.Base(originalPath))
-	if err := os.WriteFile(bpath, data, 0o644); err != nil {
+	// Pattern keeps the origin file's name visible: "ini-<random>-php.ini".
+	f, err := os.CreateTemp(backupDir, "ini-*-"+filepath.Base(originalPath))
+	if err != nil {
 		return "", fmt.Errorf("backing up %s: %w", originalPath, err)
 	}
-	return bpath, nil
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", fmt.Errorf("backing up %s: %w", originalPath, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("backing up %s: %w", originalPath, err)
+	}
+	return f.Name(), nil
 }
 
 // copyConfig copies the existing interpreter's ini files into the new

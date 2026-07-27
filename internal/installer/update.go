@@ -90,6 +90,10 @@ func updateInterpreter(ctx context.Context, opts Options, m *manifest.Manifest, 
 	io.BinDir = m.BinDir
 	io.Client = client
 	io.preloadedRelease = rel
+	// Force past the "already provided" short-circuit: the active php is our own
+	// interpreter for this series, so alreadyProvided would otherwise skip the
+	// reinstall (it does not compare release tags) and leave the old binary.
+	io.Force = true
 	return InstallInterpreter(ctx, io)
 }
 
