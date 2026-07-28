@@ -55,7 +55,7 @@ func TestUninstallInterpreterRestoresBackup(t *testing.T) {
 	var out bytes.Buffer
 	if err := Uninstall(context.Background(), Options{
 		Scope: platform.User, Out: &out, Env: &env,
-	}, false, false, "", false); err != nil {
+	}, "", false); err != nil {
 		t.Fatalf("uninstall: %v\n%s", err, out.String())
 	}
 
@@ -139,7 +139,7 @@ func TestUninstallInterpreterKeepsFilesWhenReassignFails(t *testing.T) {
 	// Uninstalling the active (only) variant must attempt the backup restore, fail,
 	// and leave everything intact.
 	err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false)
+		"", false)
 	if err == nil {
 		t.Fatal("expected uninstall to fail when backup restore fails")
 	}
@@ -208,7 +208,7 @@ func TestUninstallRestoresMultipleBackups(t *testing.T) {
 
 	env := linuxUserEnv(home)
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		true, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
 
@@ -279,7 +279,7 @@ func TestUninstallMultiBackupPartialFailureIsRetryable(t *testing.T) {
 	uOpts := Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env}
 
 	// First attempt: 8.3 restores, 8.3#1 fails.
-	if err := Uninstall(context.Background(), uOpts, true, false, "", false); err == nil {
+	if err := Uninstall(context.Background(), uOpts, "", false); err == nil {
 		t.Fatal("expected uninstall to fail on the sabotaged second restore")
 	}
 
@@ -310,7 +310,7 @@ func TestUninstallMultiBackupPartialFailureIsRetryable(t *testing.T) {
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
-	if err := Uninstall(context.Background(), uOpts, true, false, "", false); err != nil {
+	if err := Uninstall(context.Background(), uOpts, "", false); err != nil {
 		t.Fatalf("retry uninstall: %v", err)
 	}
 	if data, err := os.ReadFile(orig1); err != nil || string(data) != "EXE-ORIG" {
@@ -362,7 +362,7 @@ func TestUninstallActiveReassignsToOtherVariant(t *testing.T) {
 	// Uninstall the active 8.4 -> 8.3 should become active.
 	var out bytes.Buffer
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &out, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
 
@@ -398,7 +398,7 @@ func TestUninstallCleanHostRemovesSymlink(t *testing.T) {
 	link := filepath.Join(home, ".local", "bin", "php")
 
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
 	if _, err := os.Lstat(link); !os.IsNotExist(err) {
@@ -438,7 +438,7 @@ func TestUninstallExtension(t *testing.T) {
 
 	// Uninstall the extension.
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall extension: %v", err)
 	}
 	if _, err := os.Stat(soDst); !os.IsNotExist(err) {
@@ -490,7 +490,7 @@ func TestUninstallExtensionRestoresXdebug(t *testing.T) {
 	}
 
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall extension: %v", err)
 	}
 	// After uninstall, the ini is byte-for-byte the user's original (xdebug back).
@@ -503,10 +503,44 @@ func TestUninstallExtensionRestoresXdebug(t *testing.T) {
 	}
 }
 
+// A manifest left in the impossible both-installed state (by an older buggy
+// version) must not block uninstall with an ambiguity error: the stale extension
+// record is reconciled away and the interpreter is uninstalled normally.
+func TestUninstallReconcilesStaleExtension(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	root := filepath.Join(home, ".local", "share", "php-debugger")
+	binDir := filepath.Join(home, ".local", "bin")
+	versionDir := filepath.Join(root, "8.3")
+	writeExec(t, filepath.Join(versionDir, "bin", "php"), fakePHP("8.3.7", true, "", ""))
+	writeExec(t, filepath.Join(binDir, "php"), fakePHP("8.3.7", true, "", ""))
+
+	m := manifest.New(root, binDir)
+	m.SetInterpreter("8.3", manifest.Interpreter{Series: "8.3", PHPVersion: "8.3.7", Dir: versionDir})
+	m.SetActive("8.3")
+	m.SetExtension(manifest.Extension{Series: "8.3", ReleaseTag: "1.0.0"}) // stale, from the old bug
+	manifestPath := filepath.Join(root, "manifest.json")
+	if err := m.Save(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+
+	env := linuxUserEnv(home)
+	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
+		"", false); err != nil {
+		t.Fatalf("uninstall should reconcile and remove the interpreter, got: %v", err)
+	}
+	// Everything gone: the interpreter removed, the stale record cleaned, manifest wiped.
+	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+		t.Errorf("manifest should be gone after full uninstall, stat err=%v", err)
+	}
+}
+
 func TestUninstallNothing(t *testing.T) {
 	env := linuxUserEnv(t.TempDir())
 	err := Uninstall(context.Background(), Options{Scope: platform.User, Env: &env},
-		false, false, "", false)
+		"", false)
 	if err == nil || !strings.Contains(err.Error(), "nothing installed") {
 		t.Errorf("expected 'nothing installed', got %v", err)
 	}

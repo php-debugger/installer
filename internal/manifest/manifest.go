@@ -45,6 +45,12 @@ type Interpreter struct {
 	// compiled-in config path (copied from a replaced interpreter), recorded so
 	// uninstall can remove them.
 	ConfigFiles []string `json:"configFiles,omitempty"`
+	// ConfigBackups are the replaced interpreter's own ini files that this install
+	// sanitized in place — necessary when the new interpreter's compiled-in config
+	// path is the existing php's own directory, so the files cannot be copied
+	// elsewhere. Their originals are backed up so uninstall restores them (bringing
+	// back a stripped xdebug) instead of deleting the user's configuration.
+	ConfigBackups []FileBackup `json:"configBackups,omitempty"`
 }
 
 // Backup records an interpreter that was replaced during an install, so it can

@@ -115,6 +115,13 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	// Loaded up front so we can enforce the interpreter/extension invariant below
+	// and reused for recording at the end.
+	m, err := manifest.Load(layout.ManifestPath())
+	if err != nil {
+		return err
+	}
+
 	client := opts.Client
 	if client == nil {
 		client = release.NewClient()
@@ -189,6 +196,32 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		return fmt.Errorf("querying downloaded interpreter: %w", err)
 	}
 
+	// Enforce the invariant that the interpreter and the extension are never both
+	// installed: the interpreter has the debugger compiled in, so a standalone
+	// extension is redundant and its loader would double-register. Now that the
+	// interpreter is proven to run on this host (smoke test passed) but before any
+	// system change, remove any installed extension — reverting its ini edits so the
+	// user's original config (e.g. xdebug) is restored and then re-derived cleanly by
+	// the interpreter's own config handling below. Committed immediately so that if
+	// the install later rolls back, disk and manifest still agree the extension is
+	// gone. If existing is the php the extension modified, re-query it so its ini
+	// paths reflect the reverted state (the extension's loader file is now gone).
+	if m.Extension != nil {
+		opts.logf("Removing the previously installed debugger extension (the interpreter includes it).")
+		if err := revertExtension(opts, m.Extension); err != nil {
+			return fmt.Errorf("removing the previously installed extension: %w", err)
+		}
+		m.ClearExtension()
+		if err := m.Save(layout.ManifestPath()); err != nil {
+			return fmt.Errorf("saving manifest after removing extension: %w", err)
+		}
+		if existing != nil {
+			if refreshed, qErr := php.Query(ctx, existing.Path); qErr == nil {
+				existing = refreshed
+			}
+		}
+	}
+
 	rb := &rollback{}
 
 	// --- place the binary into the versioned directory ---
@@ -213,14 +246,27 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		rb.add(func() error { return os.RemoveAll(versionDir) })
 	}
 
-	// --- copy the existing interpreter's ini config into the new one ---
+	// --- sanitize the ini config the new interpreter will load ---
 	var configFiles []string
+	var configBackups []manifest.FileBackup
 	if existing != nil {
+		// Replacing a foreign php: copy its configuration into the new interpreter's
+		// config path (or sanitize it in place when they share a directory).
 		opts.logf("Copying existing PHP configuration (removing xdebug) ...")
-		configFiles, err = copyConfig(existing, info, rb, opts)
+		configFiles, configBackups, err = copyConfig(existing, info, layout.BackupsDir(), rb, opts)
 		if err != nil {
 			rb.run()
 			return fmt.Errorf("copying ini configuration; rolled back: %w", err)
+		}
+	} else {
+		// No foreign php to copy from (e.g. switching versions while our own
+		// interpreter is active, or a clean host). The new interpreter still reads its
+		// compiled-in config path, which may hold a same-version Homebrew xdebug it
+		// cannot load. Disable such loaders in place, backed up for restore.
+		configBackups, err = sanitizeOwnConfig(info, layout.BackupsDir(), rb, opts)
+		if err != nil {
+			rb.run()
+			return fmt.Errorf("sanitizing interpreter config; rolled back: %w", err)
 		}
 	}
 
@@ -291,22 +337,26 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	}
 
 	// --- record in the manifest ---
-	m, err := manifest.Load(layout.ManifestPath())
-	if err != nil {
-		rb.run()
-		return err
-	}
 	key := platform.VersionDirName(series, opts.ZTS)
 	m.InstallRoot = layout.Root
 	m.BinDir = linkDir
+	// Carry the config bookkeeping forward when this run did not re-derive it. A
+	// reinstall/update runs over our own already-active interpreter, so no foreign
+	// php is detected and copyConfig is skipped — but the prior record still holds
+	// the copied files and the in-place ini backups uninstall needs. preserveConfig
+	// keeps freshly-captured entries and fills the rest from the previous record.
+	if prev, ok := m.Interpreter(key); ok {
+		configFiles, configBackups = preserveConfig(prev, configFiles, configBackups)
+	}
 	m.SetInterpreter(key, manifest.Interpreter{
-		Series:      series,
-		PHPVersion:  info.Version,
-		ZTS:         opts.ZTS,
-		ReleaseTag:  rel.TagName,
-		Dir:         versionDir,
-		InstalledAt: opts.clock(),
-		ConfigFiles: configFiles,
+		Series:        series,
+		PHPVersion:    info.Version,
+		ZTS:           opts.ZTS,
+		ReleaseTag:    rel.TagName,
+		Dir:           versionDir,
+		InstalledAt:   opts.clock(),
+		ConfigFiles:   configFiles,
+		ConfigBackups: configBackups,
 	})
 	m.SetActive(key)
 	for i, b := range backups {

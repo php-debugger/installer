@@ -84,7 +84,7 @@ func TestUpdateInterpreter(t *testing.T) {
 	uo := opts
 	uo.Out = &out
 	uo.PHPVersion = "" // update figures out the target from the manifest
-	if err := Update(context.Background(), uo, false, false); err != nil {
+	if err := Update(context.Background(), uo); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out.String())
 	}
 
@@ -127,7 +127,7 @@ func TestUpdateInterpreterActiveOnPATH(t *testing.T) {
 	uo := opts
 	uo.Out = &out
 	uo.PHPVersion = ""
-	if err := Update(context.Background(), uo, false, false); err != nil {
+	if err := Update(context.Background(), uo); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out.String())
 	}
 
@@ -153,7 +153,7 @@ func TestUpdateAlreadyLatest(t *testing.T) {
 	var out bytes.Buffer
 	uo := opts
 	uo.Out = &out
-	if err := Update(context.Background(), uo, false, false); err != nil {
+	if err := Update(context.Background(), uo); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if !strings.Contains(out.String(), "up to date") {
@@ -176,7 +176,7 @@ func TestUpdateRollbackKeepsWorkingInstall(t *testing.T) {
 	var out bytes.Buffer
 	uo := opts
 	uo.Out = &out
-	err := Update(context.Background(), uo, false, false)
+	err := Update(context.Background(), uo)
 	if err == nil {
 		t.Fatalf("expected update to fail on broken release\n%s", out.String())
 	}
@@ -200,32 +200,45 @@ func TestUpdateRollbackKeepsWorkingInstall(t *testing.T) {
 
 func TestUpdateNothingInstalled(t *testing.T) {
 	env := linuxUserEnv(t.TempDir())
-	err := Update(context.Background(), Options{Scope: platform.User, Env: &env}, false, false)
+	err := Update(context.Background(), Options{Scope: platform.User, Env: &env})
 	if err == nil || !strings.Contains(err.Error(), "nothing installed") {
 		t.Errorf("expected 'nothing installed' error, got: %v", err)
 	}
 }
 
-func TestUpdateAmbiguous(t *testing.T) {
+// A manifest left in the impossible both-installed state (by an older buggy
+// version) is reconciled: the stale extension record is dropped and the update
+// proceeds on the interpreter, rather than erroring on a now-removed ambiguity.
+func TestUpdateReconcilesStaleExtension(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake php is a /bin/sh script")
 	}
 	isolatePATH(t)
 	home := t.TempDir()
 	ms := newMutableServer(t, "1.0.0", fakePHP("8.3.7", true, "", ""))
-	_, manifestPath := installBaseInterpreter(t, home, ms)
+	opts, manifestPath := installBaseInterpreter(t, home, ms)
 
-	// Also record an extension so both are present.
+	// Simulate the old bug: an extension record left alongside the interpreter.
 	m, _ := manifest.Load(manifestPath)
 	m.SetExtension(manifest.Extension{Series: "8.3", ReleaseTag: "1.0.0"})
 	if err := m.Save(manifestPath); err != nil {
 		t.Fatal(err)
 	}
 
-	env := linuxUserEnv(home)
-	err := Update(context.Background(), Options{Scope: platform.User, Env: &env}, false, false)
-	if err == nil || !strings.Contains(err.Error(), "specify") {
-		t.Errorf("expected ambiguity error, got: %v", err)
+	ms.set("2.0.0", fakePHP("8.3.9", true, "", ""))
+	var out bytes.Buffer
+	uo := opts
+	uo.Out = &out
+	if err := Update(context.Background(), uo); err != nil {
+		t.Fatalf("update should reconcile and proceed, got: %v\n%s", err, out.String())
+	}
+
+	m, _ = manifest.Load(manifestPath)
+	if m.Extension != nil {
+		t.Error("stale extension record should have been reconciled away")
+	}
+	if it, _ := m.Interpreter("8.3"); it.ReleaseTag != "2.0.0" {
+		t.Errorf("interpreter should have updated to 2.0.0, got %+v", it)
 	}
 }
 

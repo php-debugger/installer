@@ -46,6 +46,9 @@ func backupExisting(srcPath, backupDir, key string) (string, error) {
 
 // restoreBackup moves a backup back to its original path, preserving a symlink as
 // a symlink whether it moves (rename) or falls back to copy across filesystems.
+// The restored file keeps the backup's own permissions (which mirror the original
+// file's mode — see backupExisting/saveIniBackup), so a rename and the copy
+// fallback yield the same mode.
 func restoreBackup(backupPath, originalPath string) error {
 	if err := os.MkdirAll(filepath.Dir(originalPath), 0o755); err != nil {
 		return err
@@ -53,10 +56,29 @@ func restoreBackup(backupPath, originalPath string) error {
 	if err := os.Rename(backupPath, originalPath); err == nil {
 		return nil
 	}
-	if err := copyNode(backupPath, originalPath, 0o755); err != nil {
+	fi, err := os.Lstat(backupPath)
+	if err != nil {
+		return err
+	}
+	if err := copyNode(backupPath, originalPath, fi.Mode().Perm()); err != nil {
 		return err
 	}
 	return os.Remove(backupPath)
+}
+
+// copyBackup restores a backup to its original path by COPYING it (the backup file
+// is left in place, so the operation is retryable until a caller deletes it),
+// preserving the backup's own permissions (which mirror the original file's mode —
+// see saveIniBackup). A symlink is recreated as a symlink.
+func copyBackup(backupPath, originalPath string) error {
+	fi, err := os.Lstat(backupPath)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(originalPath), 0o755); err != nil {
+		return err
+	}
+	return copyNode(backupPath, originalPath, fi.Mode().Perm())
 }
 
 // copyNode copies src to dst for the cross-filesystem move fallbacks. A symlink is

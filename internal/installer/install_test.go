@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -51,6 +52,30 @@ case "$1" in
 esac
 exit 0
 `, version, modules, cfgDir, scanDir, version, series)
+}
+
+// fakePHPLoadingConfig is like fakePHP but reports a real loaded php.ini and an
+// additional parsed .ini file (via `--ini`), so tests can exercise sanitizing the
+// interpreter's OWN compiled-in config. It always reports the debugger module.
+func fakePHPLoadingConfig(version, loadedFile, scanDir, additional string) string {
+	series := version
+	if i := strings.LastIndex(version, "."); i >= 0 {
+		series = version[:i]
+	}
+	return fmt.Sprintf(`#!/bin/sh
+case "$1" in
+  -v) echo "PHP %s (cli) (built: Jan 1 2026) (NTS)" ;;
+  -m) printf '[PHP Modules]\nCore\ndate\nphp_debugger\n' ;;
+  --ini)
+    echo "Configuration File (php.ini) Path: \"%s\""
+    echo "Loaded Configuration File:         \"%s\""
+    echo "Scan for additional .ini files in: \"%s\""
+    echo "Additional .ini files parsed:      \"%s\"" ;;
+  -r) printf 'version=%s\nseries=%s\nzts=0\nextension_dir=/fake/ext\n' ;;
+  *) : ;;
+esac
+exit 0
+`, version, filepath.Dir(loadedFile), loadedFile, scanDir, additional, version, series)
 }
 
 const fakeSO = "FAKE-DEBUGGER-SO-BYTES"
@@ -185,7 +210,7 @@ func TestInstallInterpreterBacksUpUndetectedInterpreterAtDest(t *testing.T) {
 
 	// Uninstall restores the foreign php byte-for-byte.
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
 	if isLink, _ := platform.IsSymlink(foreign); isLink {
@@ -245,7 +270,7 @@ func TestInstallInterpreterBacksUpForeignSymlinkAtDest(t *testing.T) {
 
 	// Uninstall restores the user's foreign symlink, pointing at their php.
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
 	if isLink, _ := isSymlinkNode(link); !isLink {
@@ -429,6 +454,363 @@ func TestPreserveDestinationBacksUpForeignSymlink(t *testing.T) {
 	rb.run()
 	if tgt, err := os.Readlink(link); err != nil || tgt != foreignTarget {
 		t.Errorf("foreign symlink not restored on rollback: %q err=%v", tgt, err)
+	}
+}
+
+// Regression: these self-contained builds report the existing PHP's own config
+// directory as their compiled-in config path (e.g. /opt/homebrew/etc/php/8.5).
+// The interpreter install must disable the incompatible xdebug there IN PLACE but
+// back the file up — so the self-contained php stops erroring on the foreign
+// zend_extension — and uninstall must RESTORE the user's original config (never
+// delete it or prune their directory, as an earlier version did).
+func TestInstallInterpreterSharedConfigDirInPlace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+
+	// The existing php's config lives here; the NEW interpreter reports the very
+	// same directory as its config path/scan dir (the real-world collision).
+	sharedCfg := t.TempDir()
+	sharedScan := filepath.Join(sharedCfg, "conf.d")
+	srv := newFakeReleaseServer(t, fakePHP("8.3.7", true, sharedCfg, sharedScan))
+
+	existBin := filepath.Join(t.TempDir(), "bin")
+	loadedFile := filepath.Join(sharedCfg, "php.ini")
+	xdebugIni := filepath.Join(sharedScan, "xdebug.ini")
+	writeExec(t, filepath.Join(existBin, "php"),
+		existingPHPScript("8.3.4", loadedFile, sharedScan, xdebugIni))
+	if err := os.MkdirAll(sharedScan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const phpIni = "memory_limit=128M\n"
+	const xdebugContent = "zend_extension=/opt/homebrew/lib/php/xdebug.so\n"
+	if err := os.WriteFile(loadedFile, []byte(phpIni), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(xdebugIni, []byte(xdebugContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", existBin)
+
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+
+	var out bytes.Buffer
+	if err := InstallInterpreter(context.Background(), Options{
+		Scope: platform.User, AssumeYes: true, Out: &out, Client: client, Env: &env,
+	}); err != nil {
+		t.Fatalf("InstallInterpreter: %v\n%s", err, out.String())
+	}
+
+	// Install disabled the incompatible xdebug loader in the shared file...
+	if got, _ := os.ReadFile(xdebugIni); strings.Contains(string(got), "zend_extension") {
+		t.Errorf("shared xdebug.ini should have its loader stripped, got %q", got)
+	}
+	// ...backing it up (recorded as ConfigBackups, not deletable ConfigFiles).
+	root := filepath.Join(home, ".local", "share", "php-debugger")
+	m, err := manifest.Load(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, _ := m.Interpreter("8.3")
+	if len(it.ConfigFiles) != 0 {
+		t.Errorf("user's own files must not be recorded as copied ConfigFiles, got %v", it.ConfigFiles)
+	}
+	if len(it.ConfigBackups) == 0 {
+		t.Fatal("in-place sanitized file must be recorded as a ConfigBackup for restore")
+	}
+
+	// Uninstall must restore the user's original config, not delete it or prune the
+	// directory.
+	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
+		"", false); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	got, err := os.ReadFile(xdebugIni)
+	if err != nil {
+		t.Fatalf("uninstall deleted the user's xdebug.ini: %v", err)
+	}
+	if string(got) != xdebugContent {
+		t.Errorf("uninstall did not restore xdebug.ini: got %q, want %q", got, xdebugContent)
+	}
+	if fi, err := os.Stat(xdebugIni); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Errorf("restored xdebug.ini mode = %v (err %v), want 0644", fi.Mode().Perm(), err)
+	}
+}
+
+// Regression: `switch <ver>` (and any install with no foreign php on PATH, e.g.
+// while our own interpreter is active) still installs an interpreter whose
+// compiled-in config path may hold a same-version Homebrew xdebug it cannot load.
+// The install must sanitize that own config in place (backed up), or the new
+// interpreter errors trying to load the foreign zend_extension on every run.
+func TestInstallInterpreterSanitizesOwnConfigNoForeignPHP(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	isolatePATH(t) // no foreign php on PATH -> existing == nil
+	home := t.TempDir()
+
+	// The new interpreter's own compiled-in config path holds a real xdebug loader.
+	ownCfg := t.TempDir()
+	ownScan := filepath.Join(ownCfg, "conf.d")
+	loadedFile := filepath.Join(ownCfg, "php.ini")
+	xdebugIni := filepath.Join(ownScan, "xdebug.ini")
+	if err := os.MkdirAll(ownScan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const xdebugContent = "zend_extension=/opt/homebrew/lib/php/xdebug.so\n"
+	if err := os.WriteFile(loadedFile, []byte("memory_limit=128M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(xdebugIni, []byte(xdebugContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newFakeReleaseServer(t, fakePHPLoadingConfig("8.3.7", loadedFile, ownScan, xdebugIni))
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+
+	var out bytes.Buffer
+	if err := InstallInterpreter(context.Background(), Options{
+		Scope: platform.User, AssumeYes: true, Out: &out, Client: client, Env: &env,
+	}); err != nil {
+		t.Fatalf("InstallInterpreter: %v\n%s", err, out.String())
+	}
+
+	// The incompatible xdebug loader must be disabled in the interpreter's own config.
+	if got, _ := os.ReadFile(xdebugIni); strings.Contains(string(got), "zend_extension") {
+		t.Errorf("own xdebug.ini loader should be stripped, got %q", got)
+	}
+	// ...and recorded as a restorable backup, not a deletable copied file.
+	root := filepath.Join(home, ".local", "share", "php-debugger")
+	m, err := manifest.Load(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, _ := m.Interpreter("8.3")
+	if len(it.ConfigFiles) != 0 {
+		t.Errorf("own config must not be recorded as copied ConfigFiles, got %v", it.ConfigFiles)
+	}
+	if len(it.ConfigBackups) == 0 {
+		t.Fatal("sanitized own config must be recorded as a ConfigBackup for restore")
+	}
+
+	// Uninstall restores the original config, leaving the directory intact.
+	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
+		"", false); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if got, _ := os.ReadFile(xdebugIni); string(got) != xdebugContent {
+		t.Errorf("uninstall did not restore xdebug.ini: got %q, want %q", got, xdebugContent)
+	}
+}
+
+// End-to-end for the reported flow: a Homebrew php 8.5 with xdebug is on PATH;
+// `install -p 8.3` replaces it, then `switch 8.5` installs 8.5 whose compiled-in
+// config path is the Homebrew 8.5 config (xdebug there gets disabled in place).
+// Uninstalling must then restore everything: uninstalling active 8.5 brings its
+// xdebug config back and falls to 8.3; uninstalling 8.3 restores the original
+// Homebrew php. This is the specific concern — does the new own-config handling
+// uninstall correctly across multiple interpreters.
+func TestInstallSwitchUninstallLifecycle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+
+	// Homebrew 8.5 config (shared by the real php and, later, our 8.5 interpreter).
+	hb85 := t.TempDir()
+	hb85Scan := filepath.Join(hb85, "conf.d")
+	hb85Php := filepath.Join(hb85, "php.ini")
+	hb85Xdebug := filepath.Join(hb85Scan, "xdebug.ini")
+	if err := os.MkdirAll(hb85Scan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const xdebugContent = "zend_extension=/opt/homebrew/lib/php/xdebug.so\n"
+	if err := os.WriteFile(hb85Php, []byte("memory_limit=256M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hb85Xdebug, []byte(xdebugContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The 8.3 interpreter reports its own (separate) config path.
+	new83 := filepath.Join(t.TempDir(), "etc83")
+	new83Scan := filepath.Join(new83, "conf.d")
+
+	// Release serves both an 8.3 and an 8.5 interpreter asset. The 8.5 fake reports
+	// the Homebrew 8.5 config as its own compiled-in config (the real collision).
+	php83 := fakePHP("8.3.7", true, new83, new83Scan)
+	php85 := fakePHPLoadingConfig("8.5.1", hb85Php, hb85Scan, hb85Xdebug)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/php-debugger/php-debugger/releases/latest":
+			fmt.Fprintf(w, `{"tag_name":"9.9.9","assets":[
+				{"name":"php-php8.3-nts-linux-x86_64","browser_download_url":%q},
+				{"name":"php-php8.5-nts-linux-x86_64","browser_download_url":%q}
+			]}`, srv.URL+"/dl/83", srv.URL+"/dl/85")
+		case "/dl/83":
+			w.Write([]byte(php83))
+		case "/dl/85":
+			w.Write([]byte(php85))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// The Homebrew php 8.5 on PATH (with xdebug), to be replaced.
+	existBin := filepath.Join(t.TempDir(), "bin")
+	existPhp := filepath.Join(existBin, "php")
+	writeExec(t, existPhp, existingPHPScript("8.5.1", hb85Php, hb85Scan, hb85Xdebug))
+	t.Setenv("PATH", existBin)
+
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+	base := func() Options {
+		return Options{Scope: platform.User, AssumeYes: true, Out: &bytes.Buffer{}, Client: client, Env: &env}
+	}
+	root := filepath.Join(home, ".local", "share", "php-debugger")
+	manifestPath := filepath.Join(root, "manifest.json")
+
+	// 1. install -p 8.3 (replaces Homebrew 8.5). 8.5's own config is untouched here.
+	o := base()
+	o.PHPVersion = "8.3"
+	if err := InstallInterpreter(context.Background(), o); err != nil {
+		t.Fatalf("install 8.3: %v", err)
+	}
+	if got, _ := os.ReadFile(hb85Xdebug); string(got) != xdebugContent {
+		t.Fatalf("installing 8.3 must not touch the 8.5 config, got %q", got)
+	}
+
+	// 2. switch 8.5 (installs it; our 8.3 is active, so existing == nil). This must
+	//    disable the incompatible xdebug in the shared 8.5 config, backed up.
+	o = base()
+	o.PHPVersion = "8.5"
+	if err := Switch(context.Background(), o); err != nil {
+		t.Fatalf("switch 8.5: %v", err)
+	}
+	if got, _ := os.ReadFile(hb85Xdebug); strings.Contains(string(got), "zend_extension") {
+		t.Fatalf("switch 8.5 should disable xdebug in the shared config, got %q", got)
+	}
+	m, _ := manifest.Load(manifestPath)
+	if m.Active() != "8.5" {
+		t.Fatalf("active = %q, want 8.5", m.Active())
+	}
+	if it, _ := m.Interpreter("8.5"); len(it.ConfigBackups) == 0 {
+		t.Fatalf("8.5 must record a ConfigBackup for its in-place edit")
+	}
+
+	// 3. uninstall active 8.5 -> restores its xdebug config, falls back to 8.3.
+	if err := Uninstall(context.Background(), base(), "8.5", false); err != nil {
+		t.Fatalf("uninstall 8.5: %v", err)
+	}
+	if got, _ := os.ReadFile(hb85Xdebug); string(got) != xdebugContent {
+		t.Errorf("uninstall 8.5 did not restore its xdebug config: got %q", got)
+	}
+	m, _ = manifest.Load(manifestPath)
+	if m.Active() != "8.3" {
+		t.Errorf("after removing 8.5, active = %q, want 8.3", m.Active())
+	}
+	if _, err := os.Stat(filepath.Join(root, "8.3", "bin", "php")); err != nil {
+		t.Errorf("8.3 should still be installed: %v", err)
+	}
+
+	// 4. uninstall 8.3 (last one) -> restores the original Homebrew php.
+	if err := Uninstall(context.Background(), base(), "8.3", false); err != nil {
+		t.Fatalf("uninstall 8.3: %v", err)
+	}
+	// The original Homebrew php is back at its path and reports its version (i.e.
+	// the real interpreter, not a dangling symlink into our removed root).
+	if v, err := exec.Command(existPhp, "-v").CombinedOutput(); err != nil || !strings.Contains(string(v), "PHP 8.5.1") {
+		t.Errorf("original Homebrew php not restored/runnable: out=%q err=%v", v, err)
+	}
+	// The Homebrew 8.5 config remains intact (xdebug still enabled for it).
+	if got, _ := os.ReadFile(hb85Xdebug); string(got) != xdebugContent {
+		t.Errorf("Homebrew 8.5 config should still have xdebug, got %q", got)
+	}
+	// Full uninstall removed our install root.
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Errorf("install root should be gone after full uninstall, err=%v", err)
+	}
+}
+
+// Regression: an update reinstalls over our own already-active interpreter, so no
+// foreign php is detected and copyConfig is skipped. The in-place config backup
+// captured at first install must be carried forward (preserveConfig), or a later
+// uninstall could no longer restore the user's xdebug.
+func TestUpdateInterpreterPreservesSharedConfigBackup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	sharedCfg := t.TempDir()
+	sharedScan := filepath.Join(sharedCfg, "conf.d")
+	loadedFile := filepath.Join(sharedCfg, "php.ini")
+	xdebugIni := filepath.Join(sharedScan, "xdebug.ini")
+
+	existBin := filepath.Join(t.TempDir(), "bin")
+	writeExec(t, filepath.Join(existBin, "php"),
+		existingPHPScript("8.3.4", loadedFile, sharedScan, xdebugIni))
+	if err := os.MkdirAll(sharedScan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const xdebugContent = "zend_extension=/opt/homebrew/lib/php/xdebug.so\n"
+	if err := os.WriteFile(loadedFile, []byte("memory_limit=128M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(xdebugIni, []byte(xdebugContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// After install our symlink replaces the existing php here, so update finds it.
+	t.Setenv("PATH", existBin)
+
+	ms := newMutableServer(t, "1.0.0", fakePHP("8.3.7", true, sharedCfg, sharedScan))
+	client := release.NewClient()
+	client.BaseURL = ms.URL
+	env := linuxUserEnv(home)
+	opts := Options{Scope: platform.User, AssumeYes: true, Out: &bytes.Buffer{}, Client: client, Env: &env, PHPVersion: "8.3"}
+
+	if err := InstallInterpreter(context.Background(), opts); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	manifestPath := filepath.Join(home, ".local", "share", "php-debugger", "manifest.json")
+	m, _ := manifest.Load(manifestPath)
+	if it, _ := m.Interpreter("8.3"); len(it.ConfigBackups) == 0 {
+		t.Fatalf("install should record a ConfigBackup, got %+v", it)
+	}
+
+	// A newer release appears; update the interpreter.
+	ms.set("2.0.0", fakePHP("8.3.9", true, sharedCfg, sharedScan))
+	var out bytes.Buffer
+	uo := opts
+	uo.PHPVersion = ""
+	uo.Out = &out
+	if err := Update(context.Background(), uo); err != nil {
+		t.Fatalf("update: %v\n%s", err, out.String())
+	}
+
+	m, _ = manifest.Load(manifestPath)
+	it, _ := m.Interpreter("8.3")
+	if it.ReleaseTag != "2.0.0" {
+		t.Fatalf("interpreter not updated: %+v", it)
+	}
+	if len(it.ConfigBackups) == 0 {
+		t.Fatal("update lost the shared-config backup; uninstall could no longer restore xdebug")
+	}
+
+	// Uninstall after update must still restore the user's original xdebug config.
+	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
+		"", false); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if got, _ := os.ReadFile(xdebugIni); string(got) != xdebugContent {
+		t.Errorf("xdebug not restored after update+uninstall: got %q, want %q", got, xdebugContent)
 	}
 }
 

@@ -218,20 +218,10 @@ func stripXdebugFromExisting(existing *php.Info, backupDir string, rb *rollback,
 // first install), the prior backup is kept, since it holds the user's true
 // original contents. Returns fresh unchanged when there is nothing to preserve.
 func preserveBackups(prior *manifest.Extension, fresh []manifest.FileBackup) []manifest.FileBackup {
-	if prior == nil || len(prior.ConfigBackups) == 0 {
+	if prior == nil {
 		return fresh
 	}
-	freshByPath := make(map[string]bool, len(fresh))
-	for _, b := range fresh {
-		freshByPath[b.OriginalPath] = true
-	}
-	merged := append([]manifest.FileBackup(nil), fresh...)
-	for _, b := range prior.ConfigBackups {
-		if !freshByPath[b.OriginalPath] {
-			merged = append(merged, b)
-		}
-	}
-	return merged
+	return mergeFileBackups(fresh, prior.ConfigBackups)
 }
 
 // resolveExtensionDir returns an absolute extension directory. PHP sometimes

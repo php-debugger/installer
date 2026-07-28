@@ -72,7 +72,7 @@ func TestUninstallRemovesEmptyRoot(t *testing.T) {
 	}
 
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
 	if _, err := os.Stat(root); !os.IsNotExist(err) {

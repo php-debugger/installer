@@ -10,11 +10,11 @@ import (
 	"github.com/php-debugger/installer/internal/release"
 )
 
-// Update reinstalls the active interpreter and/or the extension against the
-// latest release. With neither wantInterp nor wantExt set it updates whatever is
-// installed, erroring if both are present (ambiguous). Each target is skipped if
-// already on the latest release.
-func Update(ctx context.Context, opts Options, wantInterp, wantExt bool) error {
+// Update reinstalls whatever is installed — the active interpreter or the
+// extension — against the latest release, skipping it if already up to date. The
+// interpreter and the extension are never installed at once (see the invariant in
+// InstallInterpreter), so there is nothing to disambiguate.
+func Update(ctx context.Context, opts Options) error {
 	env, err := opts.env()
 	if err != nil {
 		return err
@@ -27,31 +27,16 @@ func Update(ctx context.Context, opts Options, wantInterp, wantExt bool) error {
 	if err != nil {
 		return err
 	}
+	if err := reconcileInvariant(layout, m, opts); err != nil {
+		return err
+	}
 
 	hasInterp := m.Active() != ""
 	hasExt := m.Extension != nil
-
-	if !wantInterp && !wantExt {
-		switch {
-		case hasInterp && hasExt:
-			return errors.New("both an interpreter and an extension are installed; " +
-				"specify --interpreter or --extension")
-		case hasInterp:
-			wantInterp = true
-		case hasExt:
-			wantExt = true
-		default:
-			return errors.New("nothing installed to update")
-		}
-	}
-	if wantInterp && !hasInterp {
-		return errors.New("no interpreter installed to update")
-	}
-	if wantExt && !hasExt {
-		return errors.New("no extension installed to update")
+	if !hasInterp && !hasExt {
+		return errors.New("nothing installed to update")
 	}
 
-	// Fetch the latest release once and reuse it for the install(s).
 	client := opts.Client
 	if client == nil {
 		client = release.NewClient()
@@ -61,17 +46,10 @@ func Update(ctx context.Context, opts Options, wantInterp, wantExt bool) error {
 		return err
 	}
 
-	if wantInterp {
-		if err := updateInterpreter(ctx, opts, m, rel, client); err != nil {
-			return err
-		}
+	if hasInterp {
+		return updateInterpreter(ctx, opts, m, rel, client)
 	}
-	if wantExt {
-		if err := updateExtension(ctx, opts, m, rel, client); err != nil {
-			return err
-		}
-	}
-	return nil
+	return updateExtension(ctx, opts, m, rel, client)
 }
 
 func updateInterpreter(ctx context.Context, opts Options, m *manifest.Manifest, rel *release.Release, client *release.Client) error {
