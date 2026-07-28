@@ -14,11 +14,14 @@ import (
 	"github.com/php-debugger/installer/internal/release"
 )
 
-// Uninstall removes an installed interpreter variant or the extension. For an
-// interpreter, version selects a specific variant; empty means the active one.
-// If removing the active interpreter leaves other variants, one is activated;
-// otherwise a backed-up original interpreter is restored (if present).
-func Uninstall(ctx context.Context, opts Options, wantInterp, wantExt bool, version string, zts bool) error {
+// Uninstall removes the installed interpreter or extension. The two are never
+// installed at once (installing the interpreter removes any extension — see
+// InstallInterpreter), so the kind is unambiguous and need not be specified.
+// version selects a specific interpreter variant; empty means the active one (and
+// implies an interpreter). If removing the active interpreter leaves other
+// variants, one is activated; otherwise a backed-up original interpreter is
+// restored (if present).
+func Uninstall(ctx context.Context, opts Options, version string, zts bool) error {
 	env, err := opts.env()
 	if err != nil {
 		return err
@@ -32,29 +35,20 @@ func Uninstall(ctx context.Context, opts Options, wantInterp, wantExt bool, vers
 		return err
 	}
 
-	hasInterp := len(m.InterpreterKeys()) > 0
-	hasExt := m.Extension != nil
-
-	if !wantInterp && !wantExt {
-		switch {
-		case version != "":
-			wantInterp = true
-		case hasInterp && hasExt:
-			return errors.New("both an interpreter and an extension are installed; " +
-				"specify --interpreter or --extension")
-		case hasInterp:
-			wantInterp = true
-		case hasExt:
-			wantExt = true
-		default:
-			return errors.New("nothing installed to uninstall")
-		}
+	if err := reconcileInvariant(layout, m, opts); err != nil {
+		return err
 	}
 
-	if wantExt {
+	// A version always refers to an interpreter variant. Otherwise uninstall
+	// whichever kind is installed.
+	switch {
+	case version != "" || len(m.InterpreterKeys()) > 0:
+		return uninstallInterpreter(opts, layout, m, env, version, zts)
+	case m.Extension != nil:
 		return uninstallExtension(opts, layout, m)
+	default:
+		return errors.New("nothing installed to uninstall")
 	}
-	return uninstallInterpreter(opts, layout, m, env, version, zts)
 }
 
 func uninstallInterpreter(opts Options, layout platform.Layout, m *manifest.Manifest, env platform.Env, version string, zts bool) error {
@@ -95,6 +89,22 @@ func uninstallInterpreter(opts Options, layout platform.Layout, m *manifest.Mani
 		consumedBackups = cb
 	}
 
+	// Restore the existing php's own ini files we sanitized in place at install
+	// (e.g. bringing back a stripped xdebug). These are the user's real config files
+	// — living in a directory the new interpreter happened to share — so they are
+	// restored to their original contents, never deleted. This must precede the
+	// commit: the ini backups live under the install root, which finalizeManifest
+	// removes wholesale once nothing is installed. Restore by COPY so a failed commit
+	// stays retryable (the backup survives), then let the post-commit cleanup below
+	// drop the backup file along with the other consumed backups.
+	for _, cb := range it.ConfigBackups {
+		if err := copyBackup(cb.BackupPath, cb.OriginalPath); err != nil {
+			return fmt.Errorf("restoring %s: %w", cb.OriginalPath, err)
+		}
+		consumedBackups = append(consumedBackups, cb.BackupPath)
+		opts.logf("Restored %s.", cb.OriginalPath)
+	}
+
 	// Persist the consistent state (variant removed, active reassigned) before the
 	// destructive cleanup, so a later removal failure can only leave orphan files —
 	// never a manifest that points at an already-deleted interpreter directory.
@@ -103,9 +113,10 @@ func uninstallInterpreter(opts Options, layout platform.Layout, m *manifest.Mani
 	}
 
 	// Only now that the manifest no longer references them, delete the backup files
-	// the restore copied into place. Deferring until after the commit keeps a failed
+	// the restores copied into place. Deferring until after the commit keeps a failed
 	// save (or a partial restore) recoverable: the backups survive until the manifest
-	// that would need them for a retry is gone.
+	// that would need them for a retry is gone. (finalizeManifest may already have
+	// removed the whole root — and these with it — when nothing remains installed.)
 	for _, p := range consumedBackups {
 		_ = removeIfExists(p)
 	}
@@ -192,7 +203,23 @@ func uninstallExtension(opts Options, layout platform.Layout, m *manifest.Manife
 	if ext == nil {
 		return errors.New("no extension installed")
 	}
+	if err := revertExtension(opts, ext); err != nil {
+		return err
+	}
+	m.ClearExtension()
+	if err := finalizeManifest(layout, m); err != nil {
+		return fmt.Errorf("saving manifest: %w", err)
+	}
+	opts.logf("Uninstalled the php-debugger extension for php %s.", ext.Series)
+	return nil
+}
 
+// revertExtension undoes an extension install on disk: it removes the loader line,
+// deletes the copied .so, and restores the ini files we modified in place (bringing
+// back any xdebug we disabled). The restore runs last so it is authoritative over
+// the loader removal for a file that held both. It does not touch the manifest —
+// callers clear the record and persist.
+func revertExtension(opts Options, ext *manifest.Extension) error {
 	if ext.IniPath != "" {
 		if err := removeExtensionLoader(ext.IniPath, ext.SoPath); err != nil {
 			return fmt.Errorf("removing loader from %s: %w", ext.IniPath, err)
@@ -203,21 +230,30 @@ func uninstallExtension(opts Options, layout platform.Layout, m *manifest.Manife
 			return fmt.Errorf("removing %s: %w", ext.SoPath, err)
 		}
 	}
-	// Restore the ini files we modified in place at install (bringing back any
-	// xdebug we disabled). This runs last so it is authoritative over the loader
-	// removal above for a file that held both.
 	for _, cb := range ext.ConfigBackups {
 		if err := restoreBackup(cb.BackupPath, cb.OriginalPath); err != nil {
 			return fmt.Errorf("restoring %s: %w", cb.OriginalPath, err)
 		}
 		opts.logf("Restored %s.", cb.OriginalPath)
 	}
-	m.ClearExtension()
-	if err := finalizeManifest(layout, m); err != nil {
-		return fmt.Errorf("saving manifest: %w", err)
-	}
-	opts.logf("Uninstalled the php-debugger extension for php %s.", ext.Series)
 	return nil
+}
+
+// reconcileInvariant repairs a manifest left in the impossible state where both an
+// interpreter and the extension are recorded. Older versions installed the
+// interpreter without removing a previously installed extension; the interpreter
+// supersedes it (its loader is already disabled), so the stale extension record is
+// dropped and the manifest re-saved. The orphaned .so is inert (never loaded) and
+// left in place rather than risk touching the user's files during an unrelated
+// command. No-op for a consistent manifest.
+func reconcileInvariant(layout platform.Layout, m *manifest.Manifest, opts Options) error {
+	if m.Extension == nil || len(m.InterpreterKeys()) == 0 {
+		return nil
+	}
+	opts.logf("Note: found a stale extension record alongside an installed interpreter; " +
+		"removing it (the interpreter includes the debugger and supersedes the extension).")
+	m.ClearExtension()
+	return m.Save(layout.ManifestPath())
 }
 
 // removeExtensionLoader removes the debugger loader from an ini file: it drops

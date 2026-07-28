@@ -121,40 +121,109 @@ func saveIniBackup(backupDir, originalPath string, data []byte) (string, error) 
 		os.Remove(f.Name())
 		return "", fmt.Errorf("backing up %s: %w", originalPath, err)
 	}
+	// CreateTemp makes the backup 0600. restoreBackup reproduces the backup file's
+	// own mode on uninstall (a rename carries it over verbatim), so align the backup
+	// with the original ini's permissions — otherwise restoring would clamp a
+	// world-readable php.ini down to owner-only and php running as another user
+	// (e.g. php-fpm as www-data) could no longer read it.
+	if fi, err := os.Stat(originalPath); err == nil {
+		if err := os.Chmod(f.Name(), fi.Mode().Perm()); err != nil {
+			os.Remove(f.Name())
+			return "", fmt.Errorf("backing up %s: %w", originalPath, err)
+		}
+	}
 	return f.Name(), nil
 }
 
-// copyConfig copies the existing interpreter's ini files into the new
-// interpreter's compiled-in config path (so the new php loads the same
-// configuration), sanitizing each on the way. Returns the destination files.
+// copyConfig makes the new interpreter load the same (sanitized) configuration as
+// the one it replaces. Config files whose destination differs from their source
+// are copied into the new interpreter's compiled-in config path and returned as
+// written files (uninstall deletes them). Files whose destination IS their source
+// — which happens when the new interpreter's compiled-in config path is the
+// existing php's own directory (e.g. both report /opt/homebrew/etc/php/8.5) — are
+// instead sanitized in place with their originals backed up, and returned as
+// FileBackups (uninstall restores them). Writing a "copy" over such a file would
+// silently mutate the user's real config; deleting it on uninstall would destroy
+// their configuration and prune their directory.
 //
 // Other (non-xdebug) extension loaders are commented out only when the new
 // interpreter has a different ABI from the one it replaces — a foreign .so built
 // for a different PHP version or thread-safety cannot load and would error on
 // every run. When the replacement is the same PHP series and thread-safety, those
 // extensions load fine, so their loaders are left intact.
-func copyConfig(existing, target *php.Info, rb *rollback, opts Options) ([]string, error) {
-	pairs := interpreterConfigPairs(existing, target)
-	if len(pairs) == 0 {
+func copyConfig(existing, target *php.Info, backupDir string, rb *rollback, opts Options) ([]string, []manifest.FileBackup, error) {
+	copyPairs, sharedPairs := splitInPlacePairs(interpreterConfigPairs(existing, target))
+	if len(copyPairs) == 0 && len(sharedPairs) == 0 {
 		if target.Ini.ConfigPath == "" && target.Ini.ScanDir == "" {
 			opts.logf("Note: the interpreter reports no config path; skipping ini copy.")
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	sameABI := existing.Series == target.Series && existing.ZTS == target.ZTS
 	if sameABI {
 		opts.logf("  (same PHP %s %s as before; keeping existing extension loaders)",
 			target.Series, threading(target.ZTS))
 	}
+
 	// The debugger loader is always stripped: the interpreter has it built in, so
 	// loading a standalone php-debugger extension on top would double-register it.
-	// No backupDir: this writes copies into the new interpreter's config path and
-	// never modifies the user's originals, so there is nothing to restore later.
-	written, _, err := rewriteIniFiles(pairs, iniRewriteOptions{
+	written, _, err := rewriteIniFiles(copyPairs, iniRewriteOptions{
 		commentOtherLoaders: !sameABI,
 		stripDebuggerLoader: true,
 	}, rb, opts)
-	return written, err
+	if err != nil {
+		return written, nil, err
+	}
+
+	// In-place edits of the user's own config: sanitize (disabling the incompatible
+	// xdebug) but back up the originals so uninstall can restore them. Only files the
+	// rules actually change are touched and recorded.
+	if len(sharedPairs) > 0 {
+		opts.logf("The interpreter shares the existing PHP's config directory (%s); "+
+			"disabling incompatible extensions there (restored on uninstall).", target.Ini.ConfigPath)
+	}
+	_, backups, err := rewriteIniFiles(sharedPairs, iniRewriteOptions{
+		commentOtherLoaders: !sameABI,
+		stripDebuggerLoader: true,
+		skipUnchanged:       true,
+		backupDir:           backupDir,
+	}, rb, opts)
+	if err != nil {
+		return written, backups, err
+	}
+	return written, backups, nil
+}
+
+// preserveConfig combines the config bookkeeping captured this run with a prior
+// interpreter record's, so a reinstall/update — which runs over our own active php
+// and therefore re-copies nothing — keeps the entries uninstall needs. A freshly
+// derived set of copied files wins; otherwise the prior list is kept. In-place ini
+// backups are merged by file, freshly-captured ones winning.
+func preserveConfig(prev manifest.Interpreter, files []string, backups []manifest.FileBackup) ([]string, []manifest.FileBackup) {
+	if len(files) == 0 {
+		files = prev.ConfigFiles
+	}
+	return files, mergeFileBackups(backups, prev.ConfigBackups)
+}
+
+// mergeFileBackups returns fresh plus any prior backup for a file fresh did not
+// cover (matched by OriginalPath); a freshly-captured backup wins for its own file,
+// since it holds that file's true pre-edit contents from this run.
+func mergeFileBackups(fresh, prior []manifest.FileBackup) []manifest.FileBackup {
+	if len(prior) == 0 {
+		return fresh
+	}
+	freshByPath := make(map[string]bool, len(fresh))
+	for _, b := range fresh {
+		freshByPath[b.OriginalPath] = true
+	}
+	merged := append([]manifest.FileBackup(nil), fresh...)
+	for _, b := range prior {
+		if !freshByPath[b.OriginalPath] {
+			merged = append(merged, b)
+		}
+	}
+	return merged
 }
 
 // sanitizeInPlace applies the xdebug ini rules to the given existing ini files
@@ -164,6 +233,36 @@ func copyConfig(existing, target *php.Info, rb *rollback, opts Options) ([]strin
 func sanitizeInPlace(files []string, backupDir string, rb *rollback, opts Options) ([]manifest.FileBackup, error) {
 	_, backups, err := rewriteIniFiles(inPlacePairs(files),
 		iniRewriteOptions{skipUnchanged: true, backupDir: backupDir}, rb, opts)
+	return backups, err
+}
+
+// sanitizeOwnConfig disables extensions the freshly installed interpreter cannot
+// load from its OWN compiled-in config path. A self-contained build cannot load
+// foreign .so files, and these builds report a version-specific config path (e.g.
+// /opt/homebrew/etc/php/8.5) that is often a Homebrew php's own directory, holding
+// an xdebug loader the interpreter would choke on. It edits those files in place,
+// backing up the originals so uninstall restores them.
+//
+// This runs when no foreign php was detected to copy configuration from — most
+// importantly when switching to a new version while our own interpreter is active
+// — because the interpreter still reads whatever lives at its config path. Loaders
+// are always commented (the build cannot load any foreign extension); only files
+// the rules actually change are touched and recorded.
+func sanitizeOwnConfig(info *php.Info, backupDir string, rb *rollback, opts Options) ([]manifest.FileBackup, error) {
+	var files []string
+	if info.Ini.LoadedFile != "" {
+		files = append(files, info.Ini.LoadedFile)
+	}
+	files = append(files, info.Ini.AdditionalFiles...)
+	if len(files) == 0 {
+		return nil, nil
+	}
+	_, backups, err := rewriteIniFiles(inPlacePairs(files), iniRewriteOptions{
+		commentOtherLoaders: true,
+		stripDebuggerLoader: true,
+		skipUnchanged:       true,
+		backupDir:           backupDir,
+	}, rb, opts)
 	return backups, err
 }
 
@@ -186,6 +285,34 @@ func interpreterConfigPairs(existing, target *php.Info) []configPair {
 		}
 	}
 	return pairs
+}
+
+// splitInPlacePairs partitions config pairs into those that copy to a new location
+// (dst != src) and those whose destination resolves to the source file itself (the
+// new interpreter shares the existing php's config directory). The two groups are
+// handled differently: copies are written and deleted on uninstall; in-place edits
+// are backed up and restored on uninstall.
+func splitInPlacePairs(pairs []configPair) (copies, inPlace []configPair) {
+	for _, pr := range pairs {
+		if sameFile(pr.src, pr.dst) {
+			inPlace = append(inPlace, pr)
+		} else {
+			copies = append(copies, pr)
+		}
+	}
+	return copies, inPlace
+}
+
+// sameFile reports whether two paths refer to the same file. It compares cleaned
+// paths and, when both exist, falls back to os.SameFile so symlinked or otherwise
+// aliased paths still match.
+func sameFile(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	fa, err1 := os.Stat(a)
+	fb, err2 := os.Stat(b)
+	return err1 == nil && err2 == nil && os.SameFile(fa, fb)
 }
 
 // inPlacePairs turns a list of files into src==dst pairs for in-place rewriting.

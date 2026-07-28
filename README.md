@@ -92,8 +92,8 @@ php-debugger uninstall
 | --- | --- |
 | `install` | Install the debugger **interpreter** (default) or the **extension** (`-e`). |
 | `switch <version>` | Make an installed version active, installing it first if needed. |
-| `update` | Reinstall the active interpreter and/or extension against the latest release. |
-| `uninstall [version]` | Remove an interpreter (or the extension), restoring any backup. |
+| `update` | Reinstall whatever is installed (interpreter or extension) against the latest release. |
+| `uninstall [version]` | Remove the installed debugger (interpreter or extension), restoring any backup. |
 
 ### Flags
 
@@ -109,10 +109,14 @@ Global:
 - `-z, --zts` — thread-safe build (default: non-thread-safe; interpreter only).
 - `-e, --extension-only` — install only the extension into the current php.
 
-`update` / `uninstall`:
+`update` takes no flags — it updates whatever is installed (interpreter or
+extension), detected automatically.
 
-- `-e, --extension` / `-i, --interpreter` — pick the target when both are installed.
-- `uninstall` also takes an optional `<version>` and `-z, --zts` to target a variant.
+`uninstall`:
+
+- optional `<version>` and `-z, --zts` to target a specific interpreter variant. The
+  kind (interpreter or extension) is detected automatically — the two are never
+  installed at once, since installing the interpreter removes any extension.
 
 ## Install locations
 

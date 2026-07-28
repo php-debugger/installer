@@ -236,6 +236,76 @@ func TestInstallExtensionSkipsOwnInterpreter(t *testing.T) {
 	}
 }
 
+// Regression: installing the interpreter after the extension must remove the
+// extension (the interpreter has the debugger built in), so the two are never both
+// recorded. Otherwise uninstall would wrongly report an ambiguity ("both an
+// interpreter and an extension are installed").
+func TestInstallInterpreterRemovesInstalledExtension(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	extDir := t.TempDir()
+	iniDir := t.TempDir()
+	scanDir := filepath.Join(iniDir, "conf.d")
+	loadedFile := filepath.Join(iniDir, "php.ini")
+	const originalIni = "zend_extension=xdebug.so\nmemory_limit=100M\n"
+	if err := os.WriteFile(loadedFile, []byte(originalIni), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	writeExec(t, filepath.Join(binDir, "php"),
+		fakeExistingPHPForExt("8.3.7", extDir, loadedFile, scanDir, true))
+	t.Setenv("PATH", binDir)
+
+	srv := newFakeReleaseServer(t, fakePHP("8.3.7", true, "", ""))
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+	opts := Options{Scope: platform.User, AssumeYes: true, Out: &bytes.Buffer{}, Client: client, Env: &env}
+	manifestPath := filepath.Join(home, ".local", "share", "php-debugger", "manifest.json")
+
+	// 1. Install the extension.
+	if err := InstallExtension(context.Background(), opts); err != nil {
+		t.Fatalf("install extension: %v", err)
+	}
+	m, _ := manifest.Load(manifestPath)
+	if m.Extension == nil {
+		t.Fatal("extension should be recorded after install")
+	}
+	soDst := m.Extension.SoPath
+
+	// 2. Install the interpreter -> must remove the extension.
+	io := opts
+	io.PHPVersion = "8.3"
+	if err := InstallInterpreter(context.Background(), io); err != nil {
+		t.Fatalf("install interpreter: %v", err)
+	}
+	m, _ = manifest.Load(manifestPath)
+	if m.Extension != nil {
+		t.Error("interpreter install must remove the extension record")
+	}
+	if _, ok := m.Interpreter("8.3"); !ok {
+		t.Error("interpreter should be recorded")
+	}
+	if _, err := os.Stat(soDst); !os.IsNotExist(err) {
+		t.Errorf("extension .so should have been removed, stat err=%v", err)
+	}
+	// Reverting the extension restored the user's original xdebug config.
+	if got, _ := os.ReadFile(loadedFile); !strings.Contains(string(got), "zend_extension=xdebug.so") {
+		t.Errorf("extension removal should restore the original xdebug ini, got %q", got)
+	}
+
+	// 3. Uninstall must work with no kind ambiguity (the real bug).
+	if err := Uninstall(context.Background(), opts, "", false); err != nil {
+		t.Fatalf("uninstall after install interpreter should not error, got: %v", err)
+	}
+	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+		t.Errorf("full uninstall should remove the manifest, stat err=%v", err)
+	}
+}
+
 // mutableExtServer serves a release with a single extension asset whose tag can
 // change between requests, to simulate a newer release becoming available.
 type mutableExtServer struct {
@@ -315,7 +385,7 @@ func TestUpdateExtensionPreservesXdebugBackup(t *testing.T) {
 	var out bytes.Buffer
 	uo := opts
 	uo.Out = &out
-	if err := Update(context.Background(), uo, false, true); err != nil {
+	if err := Update(context.Background(), uo); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out.String())
 	}
 
@@ -330,7 +400,7 @@ func TestUpdateExtensionPreservesXdebugBackup(t *testing.T) {
 
 	// End-to-end: uninstall after update must restore the user's original ini.
 	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
-		false, false, "", false); err != nil {
+		"", false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
 	got, err := os.ReadFile(loadedFile)
@@ -339,6 +409,64 @@ func TestUpdateExtensionPreservesXdebugBackup(t *testing.T) {
 	}
 	if string(got) != original {
 		t.Errorf("ini not restored after update+uninstall.\n got: %q\nwant: %q", got, original)
+	}
+}
+
+// Regression: uninstalling the extension must restore the modified ini file with
+// its original permissions. The backup is created via os.CreateTemp (mode 0600),
+// so a naive restore (rename/copy) clamped a world-readable php.ini down to
+// owner-only, and php running as another user (e.g. php-fpm as www-data) could no
+// longer read it.
+func TestUninstallExtensionRestoresIniPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake php is a /bin/sh script")
+	}
+	home := t.TempDir()
+	extDir := t.TempDir()
+	iniDir := t.TempDir()
+	scanDir := filepath.Join(iniDir, "conf.d")
+	loadedFile := filepath.Join(iniDir, "php.ini")
+	const origMode os.FileMode = 0o644
+	if err := os.WriteFile(loadedFile,
+		[]byte("zend_extension=xdebug.so\nmemory_limit=100M\n"), origMode); err != nil {
+		t.Fatal(err)
+	}
+	// os.WriteFile is subject to umask; force the exact mode we assert on.
+	if err := os.Chmod(loadedFile, origMode); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	writeExec(t, filepath.Join(binDir, "php"),
+		fakeExistingPHPForExt("8.3.7", extDir, loadedFile, scanDir, true))
+	t.Setenv("PATH", binDir)
+
+	srv := newFakeReleaseServer(t, "unused")
+	client := release.NewClient()
+	client.BaseURL = srv.URL
+	env := linuxUserEnv(home)
+	opts := Options{Scope: platform.User, AssumeYes: true, Out: &bytes.Buffer{}, Client: client, Env: &env}
+
+	if err := InstallExtension(context.Background(), opts); err != nil {
+		t.Fatalf("InstallExtension: %v", err)
+	}
+	// Sanity: install backed up the ini (there was xdebug to strip).
+	m, _ := manifest.Load(filepath.Join(home, ".local", "share", "php-debugger", "manifest.json"))
+	if m.Extension == nil || len(m.Extension.ConfigBackups) == 0 {
+		t.Fatalf("install should record an ini backup, got %+v", m.Extension)
+	}
+
+	if err := Uninstall(context.Background(), Options{Scope: platform.User, Out: &bytes.Buffer{}, Env: &env},
+		"", false); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+
+	fi, err := os.Stat(loadedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != origMode {
+		t.Errorf("restored ini mode = %o, want %o (php as another user could not read it)", got, origMode)
 	}
 }
 
