@@ -249,6 +249,7 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	// --- sanitize the ini config the new interpreter will load ---
 	var configFiles []string
 	var configBackups []manifest.FileBackup
+	var extFiles []string
 	if existing != nil {
 		// Replacing a foreign php: copy its configuration into the new interpreter's
 		// config path (or sanitize it in place when they share a directory).
@@ -257,6 +258,15 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		if err != nil {
 			rb.run()
 			return fmt.Errorf("copying ini configuration; rolled back: %w", err)
+		}
+		// Same ABI: the existing php's extension loaders were kept, so copy their
+		// binaries into the new interpreter's extension_dir.
+		if sameABI(existing, info) {
+			extFiles, err = copyExtensions(ctx, existing, info, binTarget, rb, opts)
+			if err != nil {
+				rb.run()
+				return fmt.Errorf("copying extensions; rolled back: %w", err)
+			}
 		}
 	} else {
 		// No foreign php to copy from (e.g. switching versions while our own
@@ -347,16 +357,18 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	// keeps freshly-captured entries and fills the rest from the previous record.
 	if prev, ok := m.Interpreter(key); ok {
 		configFiles, configBackups = preserveConfig(prev, configFiles, configBackups)
+		extFiles = mergePaths(extFiles, prev.ExtensionFiles)
 	}
 	m.SetInterpreter(key, manifest.Interpreter{
-		Series:        series,
-		PHPVersion:    info.Version,
-		ZTS:           opts.ZTS,
-		ReleaseTag:    rel.TagName,
-		Dir:           versionDir,
-		InstalledAt:   opts.clock(),
-		ConfigFiles:   configFiles,
-		ConfigBackups: configBackups,
+		Series:         series,
+		PHPVersion:     info.Version,
+		ZTS:            opts.ZTS,
+		ReleaseTag:     rel.TagName,
+		Dir:            versionDir,
+		InstalledAt:    opts.clock(),
+		ConfigFiles:    configFiles,
+		ConfigBackups:  configBackups,
+		ExtensionFiles: extFiles,
 	})
 	m.SetActive(key)
 	for i, b := range backups {

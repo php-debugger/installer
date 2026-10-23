@@ -121,7 +121,7 @@ func uninstallInterpreter(opts Options, layout platform.Layout, m *manifest.Mani
 		_ = removeIfExists(p)
 	}
 
-	// Remove the copied config files (pruning now-empty dirs) and the versioned
+	// Remove the copied config and extension files (pruning now-empty dirs) and the versioned
 	// directory. The active `php` no longer points into it.
 	for _, f := range it.ConfigFiles {
 		if err := removeIfExists(f); err != nil {
@@ -129,6 +129,12 @@ func uninstallInterpreter(opts Options, layout platform.Layout, m *manifest.Mani
 		}
 	}
 	pruneEmptyConfigDirs(it.ConfigFiles)
+	for _, f := range it.ExtensionFiles {
+		if err := removeIfExists(f); err != nil {
+			return fmt.Errorf("removing extension %s: %w", f, err)
+		}
+	}
+	pruneEmptyConfigDirs(it.ExtensionFiles)
 	if err := os.RemoveAll(it.Dir); err != nil {
 		return fmt.Errorf("removing %s: %w", it.Dir, err)
 	}
