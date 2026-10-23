@@ -45,6 +45,10 @@ type Interpreter struct {
 	// compiled-in config path (copied from a replaced interpreter), recorded so
 	// uninstall can remove them.
 	ConfigFiles []string `json:"configFiles,omitempty"`
+	// ExtensionFiles are extension binaries (.so / .dll) this install copied from a
+	// replaced same-ABI interpreter's extension_dir into this interpreter's, so the
+	// loaders kept in the copied config resolve. Uninstall removes them.
+	ExtensionFiles []string `json:"extensionFiles,omitempty"`
 	// ConfigBackups are the replaced interpreter's own ini files that this install
 	// sanitized in place — necessary when the new interpreter's compiled-in config
 	// path is the existing php's own directory, so the files cannot be copied

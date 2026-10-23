@@ -152,9 +152,12 @@ line to add.
   `uninstall` restores it.
 - **Config carried over.** Your existing ini configuration is copied to the new
   interpreter's config path. Xdebug loaders are removed (the debugger provides its
-  own simulated xdebug), other extension loaders are commented out (a
-  self-contained build can't load foreign `.so` files), and `xdebug.mode` is
-  constrained to `off`/`debug` (with a prompt if other modes are present).
+  own simulated xdebug) and `xdebug.mode` is constrained to `off`/`debug` (with a
+  prompt if other modes are present). If the new interpreter is the same PHP
+  version and thread-safety as the old one, your other extensions keep loading:
+  their `.so`/`.dll` files are copied into the new interpreter's `extension_dir`
+  (and removed again on `uninstall`). Otherwise their loaders are commented out,
+  since extensions built for a different PHP version can't load.
 - **Post-install check + rollback.** After activating, it confirms the new `php`
   runs and reports the `php_debugger` module. Any failure rolls everything back to
   the prior working state.

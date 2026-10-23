@@ -150,7 +150,8 @@ func saveIniBackup(backupDir, originalPath string, data []byte) (string, error) 
 // interpreter has a different ABI from the one it replaces — a foreign .so built
 // for a different PHP version or thread-safety cannot load and would error on
 // every run. When the replacement is the same PHP series and thread-safety, those
-// extensions load fine, so their loaders are left intact.
+// extensions load fine, so their loaders are left intact (and InstallInterpreter
+// copies their binaries into the new interpreter's extension_dir).
 func copyConfig(existing, target *php.Info, backupDir string, rb *rollback, opts Options) ([]string, []manifest.FileBackup, error) {
 	copyPairs, sharedPairs := splitInPlacePairs(interpreterConfigPairs(existing, target))
 	if len(copyPairs) == 0 && len(sharedPairs) == 0 {
@@ -159,7 +160,7 @@ func copyConfig(existing, target *php.Info, backupDir string, rb *rollback, opts
 		}
 		return nil, nil, nil
 	}
-	sameABI := existing.Series == target.Series && existing.ZTS == target.ZTS
+	sameABI := sameABI(existing, target)
 	if sameABI {
 		opts.logf("  (same PHP %s %s as before; keeping existing extension loaders)",
 			target.Series, threading(target.ZTS))
