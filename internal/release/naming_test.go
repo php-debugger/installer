@@ -42,13 +42,23 @@ func TestParseAssetName(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name: "php-debugger-php8.3-nts-windows-x86_64.exe",
+			name: "php-php8.3-nts-windows-x64.exe",
 			want: ParsedAsset{Interpreter, "8.3", false, platform.Windows, platform.X8664},
 			ok:   true,
 		},
 		{
-			name: "php-debugger-php8.3-nts-windows-x86_64.dll",
+			name: "php_php-debugger-php8.3-nts-windows-x64.dll",
 			want: ParsedAsset{Extension, "8.3", false, platform.Windows, platform.X8664},
+			ok:   true,
+		},
+		{
+			name: "php-php8.5-ts-windows-x86_64.exe",
+			want: ParsedAsset{Interpreter, "8.5", true, platform.Windows, platform.X8664},
+			ok:   true,
+		},
+		{
+			name: "php-debugger-php8.4-nts-linux-amd64.so",
+			want: ParsedAsset{Extension, "8.4", false, platform.Linux, platform.X8664},
 			ok:   true,
 		},
 		{
@@ -107,7 +117,7 @@ func TestSelectAsset(t *testing.T) {
 		{
 			name:     "interpreter windows exe",
 			sel:      Selector{Interpreter, "8.3", false, platform.Windows, platform.X8664},
-			wantName: "php-php8.3-nts-windows-x86_64.exe",
+			wantName: "php-php8.3-nts-windows-x64.exe",
 		},
 		{
 			name:     "extension so",
@@ -117,7 +127,7 @@ func TestSelectAsset(t *testing.T) {
 		{
 			name:     "extension dll",
 			sel:      Selector{Extension, "8.3", false, platform.Windows, platform.X8664},
-			wantName: "php-debugger-php8.3-nts-windows-x86_64.dll",
+			wantName: "php_php-debugger-php8.3-nts-windows-x64.dll",
 		},
 	}
 	for _, tt := range tests {

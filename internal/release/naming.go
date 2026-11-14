@@ -56,9 +56,13 @@ var seriesRe = regexp.MustCompile(`^\d+\.\d+(?:\.\d+)*$`)
 // different prefixes. It returns ok=false for anything it does not recognize
 // (checksums, source archives, …).
 //
-// Confirmed naming in release 0.1.0:
+// Confirmed naming as of release 0.4.1:
 //   - interpreter: php-php{ver}-{nts|ts}-{os}-{arch}[.exe]
-//   - extension:   php-debugger-php{ver}-{nts|ts}-{os}-{arch}.{so|dll}
+//   - extension:   php-debugger-php{ver}-{nts|ts}-{os}-{arch}.so
+//   - windows ext: php_php-debugger-php{ver}-{nts|ts}-windows-x64.dll
+//
+// Windows assets use "x64" rather than "x86_64"; "x64", "x86_64" and "amd64"
+// are all accepted as the same architecture.
 //
 // This function is the single place that encodes the release naming convention;
 // adjust it here if the published names change.
@@ -96,7 +100,7 @@ func ParseAssetName(name string) (ParsedAsset, bool) {
 			p.OS, haveOS = platform.MacOS, true
 		case tok == "windows":
 			p.OS, haveOS = platform.Windows, true
-		case tok == "x86_64":
+		case tok == "x86_64" || tok == "x64" || tok == "amd64":
 			p.Arch, haveArch = platform.X8664, true
 		case tok == "arm64":
 			p.Arch, haveArch = platform.Arm64, true
