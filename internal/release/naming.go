@@ -50,14 +50,18 @@ var seriesRe = regexp.MustCompile(`^\d+\.\d+(?:\.\d+)*$`)
 
 // ParseAssetName interprets a release asset filename. It is deliberately
 // tolerant: rather than matching an exact template, it detects the asset kind
-// from the file suffix (.so/.dll = extension; .exe or none = interpreter) and
+// from the file suffix (.so/.dll = extension; .zip, .exe or none = interpreter) and
 // extracts the PHP series, threading model, OS and architecture from the
 // hyphen-separated tokens. This absorbs the fact that the two kinds use
 // different prefixes. It returns ok=false for anything it does not recognize
 // (checksums, source archives, …).
 //
-// Confirmed naming as of release 0.4.1:
-//   - interpreter: php-php{ver}-{nts|ts}-{os}-{arch}[.exe]
+// Release naming:
+//   - interpreter: php-php{ver}-{nts|ts}-{os}-{arch}
+//   - windows interpreter: php-php{ver}-{nts|ts}-windows-x64.zip, a bundle of
+//     php.exe with php8.dll, its dependency DLLs and ext\ (releases up to 0.4.1
+//     instead shipped a bare php-php{ver}-{nts|ts}-windows-x64.exe, which
+//     cannot run on its own)
 //   - extension:   php-debugger-php{ver}-{nts|ts}-{os}-{arch}.so
 //   - windows ext: php_php-debugger-php{ver}-{nts|ts}-windows-x64.dll
 //
@@ -78,6 +82,8 @@ func ParseAssetName(name string) (ParsedAsset, bool) {
 		kind, base = Extension, name[:len(name)-len(".dll")]
 	case strings.HasSuffix(lower, ".exe"):
 		kind, base = Interpreter, name[:len(name)-len(".exe")]
+	case strings.HasSuffix(lower, ".zip"):
+		kind, base = Interpreter, name[:len(name)-len(".zip")]
 	}
 
 	var (

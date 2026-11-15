@@ -13,10 +13,10 @@ import (
 type ActiveKind int
 
 const (
-	// KindSymlink is a real symbolic link (Unix always; Windows when permitted).
+	// KindSymlink is a real symbolic link. Activate creates one on Unix; on
+	// Windows it is only ever read back from installs made by older versions.
 	KindSymlink ActiveKind = iota
-	// KindShim is a generated .cmd wrapper used on Windows when a symlink cannot
-	// be created (symlinks there need Developer Mode or admin rights).
+	// KindShim is a generated .cmd wrapper, which Activate always uses on Windows.
 	KindShim
 )
 
@@ -29,8 +29,8 @@ func (k ActiveKind) String() string {
 
 // Activate makes the command `name` in binDir launch `target`, atomically
 // replacing any existing entry. On Unix it creates a symlink; on Windows it
-// tries a symlink first and falls back to a .cmd shim. It returns the path it
-// created and how it was materialized.
+// writes a .cmd shim. It returns the path it created and how it was
+// materialized.
 func Activate(binDir, name, target string) (string, ActiveKind, error) {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return "", 0, fmt.Errorf("creating bin dir %s: %w", binDir, err)
@@ -49,12 +49,11 @@ func activateWindows(binDir, name, target string) (string, ActiveKind, error) {
 	exePath := filepath.Join(binDir, name+".exe")
 	cmdPath := filepath.Join(binDir, name+".cmd")
 
-	// Prefer a real symlink; if it works, clear any stale shim.
-	if err := replaceSymlink(target, exePath); err == nil {
-		_ = os.Remove(cmdPath)
-		return exePath, KindSymlink, nil
-	}
-	// Symlink not permitted: write a .cmd shim and clear any stale symlink.
+	// Always a shim, never a php.exe symlink: Windows looks for an executable's
+	// DLLs in the directory it was launched from, so a symlinked php.exe would
+	// not find the php8.dll beside its target, and could even load a different
+	// PHP's php8.dll sitting next to the link. The shim runs the real php.exe
+	// from its own directory. Clear any symlink an older version created.
 	if err := writeShim(cmdPath, target); err != nil {
 		return "", 0, err
 	}

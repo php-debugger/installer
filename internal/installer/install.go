@@ -156,6 +156,10 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 		return nil
 	}
 
+	if err := requireWritableRoot(layout, p.OS); err != nil {
+		return err
+	}
+
 	// Detect a pre-existing interpreter before we change anything. Ignore one
 	// that is our own previous install (avoid backing up our own symlink).
 	existing := detectExisting(ctx, opts, layout.Root)
@@ -181,6 +185,20 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 	dlPath, err := client.Download(ctx, asset, tmpDir)
 	if err != nil {
 		return err
+	}
+	// A bundle (Windows) is unpacked first. Its php binary only runs with the
+	// libraries beside it, so it is smoke-tested from inside the unpacked tree,
+	// and the whole tree is installed below.
+	bundleDir := ""
+	if isBundleAsset(asset.Name) {
+		bundleDir = filepath.Join(tmpDir, "bundle")
+		if err := extractBundle(dlPath, bundleDir); err != nil {
+			return fmt.Errorf("unpacking %s: %w", asset.Name, err)
+		}
+		dlPath = filepath.Join(bundleDir, phpBinaryName(p.OS))
+		if _, err := os.Stat(dlPath); err != nil {
+			return fmt.Errorf("%s has no %s at its top level", asset.Name, phpBinaryName(p.OS))
+		}
 	}
 	if err := os.Chmod(dlPath, 0o755); err != nil {
 		return err
@@ -224,26 +242,44 @@ func InstallInterpreter(ctx context.Context, opts Options) error {
 
 	rb := &rollback{}
 
-	// --- place the binary into the versioned directory ---
+	// --- place the binary (or the whole bundle) into the versioned directory ---
 	versionDir := layout.VersionDir(series, opts.ZTS)
 	binTarget := filepath.Join(versionDir, "bin", phpBinaryName(p.OS))
 	// If the version dir already exists (an update/reinstall), preserve the old
-	// binary so a failed install can be rolled back to a working state; else the
+	// files so a failed install can be rolled back to a working state; else the
 	// whole fresh dir is removed on rollback.
 	versionExisted := isDir(versionDir)
-	if versionExisted {
-		if err := registerFileRestore(binTarget, rb, 0o755); err != nil {
-			return err
+	if bundleDir != "" {
+		var undo *rollback
+		if versionExisted {
+			undo = rb
 		}
+		err = installBundle(bundleDir, filepath.Dir(binTarget), undo)
+	} else {
+		if versionExisted {
+			if err := registerFileRestore(binTarget, rb, 0o755); err != nil {
+				return err
+			}
+		}
+		err = installFile(dlPath, binTarget)
 	}
-	if err := installFile(dlPath, binTarget); err != nil {
-		if !versionExisted {
+	if err != nil {
+		if versionExisted {
+			rb.run()
+		} else {
 			os.RemoveAll(versionDir)
 		}
-		return fmt.Errorf("installing interpreter binary: %w", err)
+		return fmt.Errorf("installing interpreter: %w", err)
 	}
 	if !versionExisted {
 		rb.add(func() error { return os.RemoveAll(versionDir) })
+	}
+
+	// On Windows, PHP's compiled-in config path is %SystemRoot% (C:\Windows), but
+	// the CLI reads the php.ini next to php.exe first. The interpreter's config
+	// belongs there, inside its own directory, never in the shared Windows dir.
+	if p.OS == platform.Windows {
+		info.Ini.ConfigPath = filepath.Dir(binTarget)
 	}
 
 	// --- sanitize the ini config the new interpreter will load ---
@@ -568,6 +604,22 @@ func phpBinaryName(osID platform.OS) string {
 		return "php.exe"
 	}
 	return "php"
+}
+
+// requireWritableRoot fails fast, before anything is downloaded or changed, when
+// the install root cannot be written. Every install records its manifest and
+// config backups there, even an extension-only install into a php the user owns,
+// so the default system scope (Program Files, /opt) needs elevation.
+func requireWritableRoot(layout platform.Layout, osID platform.OS) error {
+	if platform.IsDirWritable(layout.Root) {
+		return nil
+	}
+	elevate := "re-run with sudo"
+	if osID == platform.Windows {
+		elevate = "re-run from an elevated terminal (Run as administrator)"
+	}
+	return fmt.Errorf("cannot write to %s, where php-debugger keeps its install record and config backups\n"+
+		"%s, or add --user to install into a per-user directory instead", layout.Root, elevate)
 }
 
 func smokeFailureError(err error) error {

@@ -52,6 +52,11 @@ func TestParseAssetName(t *testing.T) {
 			ok:   true,
 		},
 		{
+			name: "php-php8.5-nts-windows-x64.zip",
+			want: ParsedAsset{Interpreter, "8.5", false, platform.Windows, platform.X8664},
+			ok:   true,
+		},
+		{
 			name: "php-php8.5-ts-windows-x86_64.exe",
 			want: ParsedAsset{Interpreter, "8.5", true, platform.Windows, platform.X8664},
 			ok:   true,
@@ -68,6 +73,7 @@ func TestParseAssetName(t *testing.T) {
 			ok:   true,
 		},
 		{"checksums.txt", ParsedAsset{}, false},
+		{"php-8.5.0-src.zip", ParsedAsset{}, false},
 		{"php-debugger-php8.3-nts-linux", ParsedAsset{}, false},    // no arch
 		{"php-debugger-nts-linux-x86_64", ParsedAsset{}, false},    // no version
 		{"php-debugger-php8.3-linux-x86_64", ParsedAsset{}, false}, // no threading
