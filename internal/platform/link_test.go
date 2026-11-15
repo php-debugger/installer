@@ -142,6 +142,36 @@ func TestRemoveActive(t *testing.T) {
 	}
 }
 
+// On Windows, activation must always write a php.cmd shim: a php.exe symlink
+// would make Windows look for php8.dll next to the link, not the target.
+func TestActivateWindowsAlwaysShim(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows activation")
+	}
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	target := filepath.Join(dir, "8.3", "bin", "php.exe")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, target, "MZ")
+
+	path, kind, err := Activate(binDir, "php", target)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if kind != KindShim || path != filepath.Join(binDir, "php.cmd") {
+		t.Errorf("Activate = (%q, %v), want (%q, shim)", path, kind, filepath.Join(binDir, "php.cmd"))
+	}
+	if _, err := os.Lstat(filepath.Join(binDir, "php.exe")); !os.IsNotExist(err) {
+		t.Errorf("no php.exe should exist in the bin dir (err %v)", err)
+	}
+	got, gotKind, ok := ReadActive(binDir, "php")
+	if !ok || got != target || gotKind != KindShim {
+		t.Errorf("ReadActive = (%q, %v, %v), want (%q, shim, true)", got, gotKind, ok, target)
+	}
+}
+
 func TestReadActiveMissing(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, ok := ReadActive(dir, "php"); ok {

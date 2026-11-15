@@ -123,7 +123,9 @@ extension), detected automatically.
 Interpreters are installed under a versioned directory and the active one is
 symlinked onto your PATH.
 
-**System-wide (default, needs sudo/admin):**
+**System-wide (default, needs sudo/admin):** this also applies to
+`--extension-only`, which keeps its install record and config backups under the
+install root. Without sudo/admin, use `--user`.
 
 | Platform | Install root | Active `php` |
 | --- | --- | --- |
@@ -166,9 +168,13 @@ line to add.
 
 ## Platform support
 
-Linux, macOS and Windows; x86_64 and arm64. On Windows, where symlinks require
-elevated privileges, the active `php` falls back to a generated `.cmd` shim. On
-Apple Silicon, an x86_64 build still installs native arm64 binaries.
+Linux, macOS and Windows; x86_64 and arm64. On Windows the interpreter is a zip
+bundle (`php.exe` plus `php8.dll`, its dependency DLLs and `ext\`) unpacked into
+`<root>\<version>\bin`. Its config goes in `php.ini` next to `php.exe`, and the
+active `php` is a generated `php.cmd` shim rather than a symlink: Windows looks for
+an executable's DLLs next to the path it was started from, so a symlinked
+`php.exe` would not find its `php8.dll`. On Apple Silicon, an x86_64 build still
+installs native arm64 binaries.
 
 ## Development
 

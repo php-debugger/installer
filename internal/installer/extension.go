@@ -65,6 +65,10 @@ func InstallExtension(ctx context.Context, opts Options) error {
 		return fmt.Errorf("php at %s reports no extension_dir; cannot install the extension", path)
 	}
 
+	if err := requireWritableRoot(layout, p.OS); err != nil {
+		return err
+	}
+
 	client := opts.Client
 	if client == nil {
 		client = release.NewClient()
