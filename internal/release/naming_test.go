@@ -72,6 +72,26 @@ func TestParseAssetName(t *testing.T) {
 			want: ParsedAsset{Interpreter, "8.2", true, platform.Linux, platform.Arm64},
 			ok:   true,
 		},
+		{
+			name: "php-php8.6-ts-linux-arm64",
+			want: ParsedAsset{Interpreter, "8.6", true, platform.Linux, platform.Arm64},
+			ok:   true,
+		},
+		{
+			name: "php-debugger-php8.6-nts-macos-arm64.so",
+			want: ParsedAsset{Extension, "8.6", false, platform.MacOS, platform.Arm64},
+			ok:   true,
+		},
+		{
+			name: "php-php8.6-ts-windows-x64.zip",
+			want: ParsedAsset{Interpreter, "8.6", true, platform.Windows, platform.X8664},
+			ok:   true,
+		},
+		{
+			name: "php_php-debugger-php8.6-nts-windows-x64.dll",
+			want: ParsedAsset{Extension, "8.6", false, platform.Windows, platform.X8664},
+			ok:   true,
+		},
 		{"checksums.txt", ParsedAsset{}, false},
 		{"php-8.5.0-src.zip", ParsedAsset{}, false},
 		{"php-debugger-php8.3-nts-linux", ParsedAsset{}, false},    // no arch
@@ -182,6 +202,33 @@ func TestLatestSeries(t *testing.T) {
 	// no ts interpreter for macos/x86_64 in fixture
 	if _, err := LatestSeries(rel.Assets, Interpreter, true, platform.MacOS, platform.X8664); err == nil {
 		t.Error("expected error when no variant matches")
+	}
+}
+
+// PHP 8.6 assets (as published in release 0.6.2) are selected as the latest and
+// can be requested explicitly, for both the interpreter and the extension.
+func TestPHP86Assets(t *testing.T) {
+	var assets []Asset
+	for _, n := range []string{
+		"php-php8.5-nts-linux-x86_64",
+		"php-php8.6-nts-linux-x86_64",
+		"php-php8.6-ts-linux-x86_64",
+		"php-debugger-php8.5-nts-linux-x86_64.so",
+		"php-debugger-php8.6-nts-linux-x86_64.so",
+	} {
+		assets = append(assets, Asset{Name: n})
+	}
+
+	for _, kind := range []Kind{Interpreter, Extension} {
+		got, err := LatestSeries(assets, kind, false, platform.Linux, platform.X8664)
+		if err != nil || got != "8.6" {
+			t.Errorf("LatestSeries(%s) = %q, %v; want 8.6", kind, got, err)
+		}
+	}
+
+	a, err := SelectAsset(assets, Selector{Interpreter, "8.6", true, platform.Linux, platform.X8664})
+	if err != nil || a.Name != "php-php8.6-ts-linux-x86_64" {
+		t.Errorf("SelectAsset(8.6 ts) = %q, %v", a.Name, err)
 	}
 }
 
